@@ -49,6 +49,9 @@ typedef uint64_t fuse_ino_t;
 /** Request pointer type */
 typedef struct fuse_req *fuse_req_t;
 
+/* Forward declaration */
+struct statx;
+
 /**
  * Session
  *
@@ -167,9 +170,7 @@ enum fuse_notify_entry_flags {
 #define FUSE_SET_ATTR_KILL_PRIV	(1 << 14)
 #define FUSE_SET_ATTR_OPEN	(1 << 15)
 #define FUSE_SET_ATTR_TIMES_SET	(1 << 16)
-#define FUSE_SET_ATTR_TOUCH	(1 << 17)
-
-/* ----------------------------------------------------------- *
+#define FUSE_SET_ATTR_TOUCH	(1 << 17) /* ----------------------------------------------------------- *
  * Request methods and replies				       *
  * ----------------------------------------------------------- */
 
@@ -1303,7 +1304,6 @@ struct fuse_lowlevel_ops {
 	void (*lseek) (fuse_req_t req, fuse_ino_t ino, off_t off, int whence,
 		       struct fuse_file_info *fi);
 
-
 	/**
 	 * Create a tempfile
 	 * 
@@ -1325,6 +1325,21 @@ struct fuse_lowlevel_ops {
 	void (*tmpfile) (fuse_req_t req, fuse_ino_t parent,
 			mode_t mode, struct fuse_file_info *fi);
 
+	/**
+	 * Get extended file attributes.
+	 *
+	 * Valid replies:
+	 *   fuse_reply_statx
+	 *   fuse_reply_err
+	 *
+	 * @param req request handle
+	 * @param ino the inode number
+	 * @param flags bitmask of requested flags
+	 * @param mask bitmask of requested fields
+	 * @param fi file information (may be NULL)
+	 */
+	void (*statx)(fuse_req_t req, fuse_ino_t ino, int flags, int mask,
+		      struct fuse_file_info *fi);
 };
 
 /**
@@ -1702,6 +1717,22 @@ int fuse_reply_poll(fuse_req_t req, unsigned revents);
  * @return zero for success, -errno for failure to send reply
  */
 int fuse_reply_lseek(fuse_req_t req, off_t off);
+
+#ifdef HAVE_STATX
+/**
+ * Reply with extended file attributes.
+ *
+ * Possible requests:
+ *   statx
+ *
+ * @param req request handle
+ * @param flags statx flags
+ * @param statx the attributes
+ * @param attr_timeout	validity timeout (in seconds) for the attributes
+ * @return zero for success, -errno for failure to send reply
+ */
+int fuse_reply_statx(fuse_req_t req, int flags, struct statx *statx, double attr_timeout);
+#endif
 
 /* ----------------------------------------------------------- *
  * Notification						       *
