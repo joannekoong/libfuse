@@ -201,6 +201,11 @@ unsigned get_max_read(struct mount_opts *o)
 	return o->max_read;
 }
 
+const char *get_subtype(struct mount_opts *o)
+{
+	return o->subtype;
+}
+
 static void set_mount_flag(const char *s, int *flags)
 {
 	int i;

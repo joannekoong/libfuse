@@ -1962,6 +1962,52 @@ static void do_lseek(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 		fuse_reply_err(req, ENOSYS);
 }
 
+static void sysfs_conn_info(struct fuse_session *se, uint32_t dev_id)
+{
+	char sysfs_conn_info_path[64];
+	const char *subtype;
+	char info[64];
+	pid_t pid;
+	int fd;
+	int err;
+
+	err = snprintf(sysfs_conn_info_path, sizeof(sysfs_conn_info_path),
+		       "/sys/fs/fuse/connections/%u/info", dev_id);
+	if (err <= 0) {
+		fuse_log(FUSE_LOG_ERR, "fuse: snprintf for sysfs_conn_info_path failed. "
+			 "Error: %s\n", strerror(errno));
+		return;
+	}
+
+	fd = open(sysfs_conn_info_path, O_WRONLY);
+	if (fd == -1) {
+		fuse_log(FUSE_LOG_ERR, "fuse: could not open sysfs path: %s. "
+			 "Error: %s\n", sysfs_conn_info_path, strerror(errno));
+		return;
+	}
+
+	subtype = get_subtype(se->mo);
+	pid = getpid();
+
+	if (subtype)
+		err = snprintf(info, sizeof(info), "%s\npid=%u\n", subtype, pid);
+	else
+		err = snprintf(info, sizeof(info), "pid=%u\n", pid);
+	if (err <= 0) {
+	    fuse_log(FUSE_LOG_ERR, "fuse: snprintf for connection info failed. "
+		     "Error: %s\n", strerror(errno));
+	    close(fd);
+	    return;
+	}
+
+	err = write(fd, info, strlen(info));
+	if (err == -1)
+	    fuse_log(FUSE_LOG_ERR, "fuse: sysfs_conn_info write failed. "
+		     "Error: %s\n", strerror(errno));
+
+	close(fd);
+}
+
 /* Prevent bogus data races (bogus since "init" is called before
  * multi-threading becomes relevant */
 static __attribute__((no_sanitize("thread")))
@@ -2083,6 +2129,9 @@ void do_init(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 	}
 	if (se->conn.proto_minor >= 18)
 		se->conn.capable |= FUSE_CAP_IOCTL_DIR;
+
+	if (arg->dev_id)
+	    sysfs_conn_info(se, arg->dev_id);
 
 	/* Default settings for modern filesystems.
 	 *

@@ -167,6 +167,7 @@ struct mount_opts *parse_mount_opts(struct fuse_args *args);
 void destroy_mount_opts(struct mount_opts *mo);
 void fuse_mount_version(void);
 unsigned get_max_read(struct mount_opts *o);
+const char *get_subtype(struct mount_opts *o);
 void fuse_kern_unmount(const char *mountpoint, int fd);
 int fuse_kern_mount(const char *mountpoint, struct mount_opts *mo);
 
