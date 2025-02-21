@@ -31,6 +31,7 @@
 #include <assert.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
+#include <sys/sdt.h>
 
 #ifndef F_LINUX_SPECIFIC_BASE
 #define F_LINUX_SPECIFIC_BASE       1024
@@ -206,6 +207,7 @@ static int fuse_send_msg(struct fuse_session *se, struct fuse_chan *ch,
 		res = writev(ch ? ch->fd : se->fd, iov, count);
 
 	int err = errno;
+	trace_request_reply(out->unique, out->len, out->error, err);
 
 	if (res == -1) {
 		/* ENOENT means the operation was interrupted */
@@ -2825,6 +2827,8 @@ void fuse_session_process_buf_internal(struct fuse_session *se,
 		in = buf->mem;
 	}
 
+	trace_request_process(in->opcode, in->unique);
+
 	if (se->debug) {
 		fuse_log(FUSE_LOG_DEBUG,
 			"unique: %llu, opcode: %s (%i), nodeid: %llu, insize: %zu, pid: %u\n",
@@ -3080,6 +3084,7 @@ static int _fuse_session_receive_buf(struct fuse_session *se,
 			     bufsize, 0);
 	}
 	err = errno;
+	trace_request_read(err);
 
 	if (fuse_session_exited(se))
 		return 0;
@@ -3182,7 +3187,9 @@ restart:
 	} else {
 		res = read(ch ? ch->fd : se->fd, buf->mem, bufsize);
 	}
+
 	err = errno;
+	trace_request_read(err);
 
 	if (fuse_session_exited(se))
 		return 0;
@@ -3572,4 +3579,20 @@ __attribute__((no_sanitize_thread))
 int fuse_session_exited(struct fuse_session *se)
 {
 	return se->exited;
+}
+
+/* tracepoints */
+void __attribute__((noinline)) trace_request_read(int err)
+{
+    STAP_PROBE1(libfuse, request_read, err);
+}
+
+void __attribute__((noinline)) trace_request_process(uint32_t opcode, uint32_t unique)
+{
+    STAP_PROBE2(libfuse, request_process, opcode, unique);
+}
+
+void __attribute__((noinline)) trace_request_reply(uint64_t unique, uint32_t len, int32_t error, int32_t reply_err)
+{
+    STAP_PROBE4(libfuse, request_reply, unique, len, error, reply_err);
 }

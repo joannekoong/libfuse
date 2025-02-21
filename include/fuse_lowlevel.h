@@ -23,6 +23,7 @@
 #endif
 
 #include "fuse_common.h"
+#include "fuse_kernel.h"
 
 #include <stddef.h>
 #include <utime.h>
@@ -2314,6 +2315,10 @@ void fuse_session_process_buf(struct fuse_session *se,
  * @return the actual size of the raw request, or -errno on error
  */
 int fuse_session_receive_buf(struct fuse_session *se, struct fuse_buf *buf);
+
+void __attribute__((noinline)) trace_request_read(int err);
+void __attribute__((noinline)) trace_request_process(uint32_t opcode, uint32_t unique);
+void __attribute__((noinline)) trace_request_reply(uint64_t unique, uint32_t len, int32_t error, int32_t reply_err);
 
 #ifdef __cplusplus
 }
