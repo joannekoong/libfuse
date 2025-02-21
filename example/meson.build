@@ -18,9 +18,11 @@ threaded_examples = [ 'notify_inval_inode',
                       'notify_inval_entry',
                       'poll' ]
 
+libbpf_dep = cc.find_library('bpf', required: true)
+
 foreach ex : examples
     executable(ex, ex + '.c',
-               dependencies: [ libfuse_dep ],
+               dependencies: [ libfuse_dep, libbpf_dep ],
                install: false)
 endforeach
 

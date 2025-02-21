@@ -29,6 +29,9 @@
 #include <unistd.h>
 #include <assert.h>
 
+#include <bpf/libbpf.h>
+#include "usdt.skel.h"
+
 static const char *hello_str = "Hello World!\n";
 static const char *hello_name = "hello";
 
@@ -228,6 +231,34 @@ int main(int argc, char *argv[])
 	struct fuse_cmdline_opts opts;
 	struct fuse_loop_config *config;
 	int ret = -1;
+	struct usdt_bpf *skel;
+	int err;
+
+	/*  attach tracepoints to monitor requests */
+	skel = usdt_bpf__open();
+	if (!skel) {
+		fprintf(stderr, "Failed to open BPF skeleton\n");
+		exit(1);
+	}
+
+	err = usdt_bpf__load(skel);
+	if (!skel) {
+		fprintf(stderr, "Failed to load BPF skeleton\n");
+		exit(1);
+	}
+
+	skel->links.usdt_attach = bpf_program__attach_usdt(
+		skel->progs.usdt_attach, getpid(), "/home/vmuser/libfuse/build/lib/libfuse3.so", "libfuse", "request_process", NULL);
+	if (!skel->links.usdt_attach) {
+		fprintf(stderr, "Failed to attach BPF program `usdt_attach`\n");
+		exit(1);
+	}
+
+	err = usdt_bpf__attach(skel);
+	if (err) {
+		fprintf(stderr, "Failed to attach BPF skeleton\n");
+		exit(1);
+	}
 
 	if (fuse_parse_cmdline(&args, &opts) != 0)
 		return 1;
@@ -262,7 +293,7 @@ int main(int argc, char *argv[])
 	if (fuse_session_mount(se, opts.mountpoint) != 0)
 	    goto err_out3;
 
-	fuse_daemonize(opts.foreground);
+	fuse_daemonize(1);
 
 	/* Block until ctrl+c or fusermount -u */
 	if (opts.singlethread)
