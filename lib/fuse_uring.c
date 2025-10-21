@@ -325,12 +325,17 @@ int fuse_send_msg_uring(fuse_req_t req, struct iovec *iov, int count)
 	return fuse_uring_commit_sqe(ring_pool, queue, ring_ent);
 }
 
-static int fuse_queue_setup_io_uring(struct io_uring *ring, size_t qid,
-				     size_t depth, int fd, int evfd)
+static int fuse_queue_setup_io_uring(struct fuse_ring_queue *queue)
 {
-	int rc;
-	struct io_uring_params params = {0};
+	struct fuse_ring_pool *ring_pool = queue->ring_pool;
+	struct io_uring *ring = &queue->ring;
+	int fd = ring_pool->se->fd;
+	int evfd = queue->eventfd;
+	int qid = queue->qid;
+	size_t depth = ring_pool->queue_depth;
 	int files[2] = { fd, evfd };
+	struct io_uring_params params = {0};
+	int rc;
 
 	depth += 1; /* for the eventfd poll SQE */
 
@@ -669,9 +674,7 @@ static int fuse_uring_init_queue(struct fuse_ring_queue *queue)
 		return res;
 	}
 
-	res = fuse_queue_setup_io_uring(&queue->ring, queue->qid,
-					ring->queue_depth, se->fd,
-					queue->eventfd);
+	res = fuse_queue_setup_io_uring(queue);
 	if (res != 0) {
 		fuse_log(FUSE_LOG_ERR, "qid=%d io_uring init failed\n",
 			 queue->qid);
