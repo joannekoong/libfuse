@@ -361,7 +361,7 @@ static int fuse_queue_setup_io_uring(struct fuse_ring_queue *queue)
 
 	rc = io_uring_queue_init_params(depth, ring, &params);
 	if (rc != 0) {
-		fuse_log(FUSE_LOG_ERR, "Failed to setup qid %zu: %d (%s)\n",
+		fuse_log(FUSE_LOG_ERR, "Failed to setup qid %d: %d (%s)\n",
 			 qid, rc, strerror(-rc));
 		return rc;
 	}
@@ -370,7 +370,7 @@ static int fuse_queue_setup_io_uring(struct fuse_ring_queue *queue)
 	if (rc != 0) {
 		rc = -errno;
 		fuse_log(FUSE_LOG_ERR,
-			 "Failed to register files for ring idx %zu: %s",
+			 "Failed to register files for ring idx %d: %s",
 			 qid, strerror(errno));
 		return rc;
 	}
