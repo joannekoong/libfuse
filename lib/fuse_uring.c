@@ -40,11 +40,22 @@ struct fuse_ring_ent {
 	void *op_payload;
 	size_t req_payload_sz;
 
+	/*
+	 * True if the buffers are preregistered ahead of time.
+	 *
+	 * We do this by default but if the kernel doesn't support this, then
+	 * we fall back to using user addresses
+	 */
+	bool is_fixed_buffer;
+
+	union {
+	    uint16_t buf_index;
+	    /* Used if buffers are not preregistered */
+	    struct iovec iov[2];
+	};
+
 	/* commit id of a fuse request */
 	uint64_t req_commit_id;
-
-	/* header and payload */
-	struct iovec iov[2];
 };
 
 struct fuse_ring_queue {
@@ -138,6 +149,7 @@ fuse_uring_sqe_prepare(struct io_uring_sqe *sqe, struct fuse_ring_ent *req,
 	 * given to io_uring_register_files()
 	 */
 	sqe->flags = IOSQE_FIXED_FILE;
+	sqe->uring_cmd_flags = 0;
 	sqe->fd = 0;
 
 	sqe->rw_flags = 0;
@@ -148,6 +160,12 @@ fuse_uring_sqe_prepare(struct io_uring_sqe *sqe, struct fuse_ring_ent *req,
 
 	sqe->cmd_op = cmd_op;
 	sqe->__pad1 = 0;
+
+	/* Use pre-registered buffers */
+	if (req->is_fixed_buffer) {
+	    sqe->uring_cmd_flags |= IORING_URING_CMD_FIXED;
+	    sqe->buf_index = req->buf_index;
+	}
 }
 
 static int fuse_uring_commit_sqe(struct fuse_ring_pool *ring_pool,
@@ -325,7 +343,8 @@ int fuse_send_msg_uring(fuse_req_t req, struct iovec *iov, int count)
 	return fuse_uring_commit_sqe(ring_pool, queue, ring_ent);
 }
 
-static int fuse_queue_setup_io_uring(struct fuse_ring_queue *queue)
+static int fuse_queue_setup_io_uring(struct fuse_ring_queue *queue,
+				     struct iovec **buffer_iovs)
 {
 	struct fuse_ring_pool *ring_pool = queue->ring_pool;
 	struct io_uring *ring = &queue->ring;
@@ -335,7 +354,8 @@ static int fuse_queue_setup_io_uring(struct fuse_ring_queue *queue)
 	size_t depth = ring_pool->queue_depth;
 	int files[2] = { fd, evfd };
 	struct io_uring_params params = {0};
-	int rc;
+	struct iovec *iovs = NULL;
+	int rc, i, nr_allocations = 0;
 
 	depth += 1; /* for the eventfd poll SQE */
 
@@ -375,7 +395,42 @@ static int fuse_queue_setup_io_uring(struct fuse_ring_queue *queue)
 		return rc;
 	}
 
+	iovs = malloc(depth * sizeof(struct iovec));
+	if (!iovs) {
+		fuse_log(FUSE_LOG_ERR,
+			 "Failed to allocate iovs for ring idx %d", qid);
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < depth; i++) {
+		size_t len;
+		void *addr;
+
+		len = ring_pool->max_req_payload_sz + queue->req_header_sz;
+		addr = numa_alloc_local(len);
+		if (!addr) {
+			fuse_log(FUSE_LOG_ERR,
+				 "Failed to allocate buffer for ring idx %d", qid);
+			goto error;
+		}
+
+		iovs[i].iov_base = addr;
+		iovs[i].iov_len = len;
+		nr_allocations++;
+	}
+	rc = io_uring_register_buffers(ring, iovs, depth);
+	if (rc)
+		goto error;
+
+	*buffer_iovs = iovs;
+
 	return 0;
+
+error:
+	for (i = 0; i < nr_allocations; i++)
+		numa_free(iovs[i].iov_base, iovs[i].iov_len);
+	free(iovs);
+	return rc;
 }
 
 static void fuse_session_destruct_uring(struct fuse_ring_pool *fuse_ring)
@@ -410,14 +465,35 @@ static void fuse_session_destruct_uring(struct fuse_ring_pool *fuse_ring)
 			struct fuse_ring_ent *ent = &queue->ent[idx];
 
 			numa_free(ent->op_payload, ent->req_payload_sz);
-			numa_free(ent->req_header, queue->req_header_sz);
+			if (!ent->is_fixed_buffer)
+			    numa_free(ent->req_header, queue->req_header_sz);
 		}
+		io_uring_unregister_buffers(&queue->ring);
 	}
 
 	free(fuse_ring->queues);
 	pthread_cond_destroy(&fuse_ring->thread_start_cond);
 	pthread_mutex_destroy(&fuse_ring->thread_start_mutex);
 	free(fuse_ring);
+}
+
+static struct io_uring_sqe *fuse_sqe_register(struct fuse_ring_queue *queue,
+			      struct fuse_ring_ent *ent)
+{
+	struct io_uring_sqe *sqe;
+
+	sqe = io_uring_get_sqe(&queue->ring);
+	if (sqe == NULL) {
+		fuse_log(FUSE_LOG_ERR, "Failed to get ring SQE");
+		return NULL;
+	}
+
+	fuse_uring_sqe_prepare(sqe, ent, FUSE_IO_URING_CMD_REGISTER);
+
+	fuse_uring_sqe_set_req_data(fuse_uring_get_sqe_cmd(sqe),
+				    queue->qid, 0);
+
+	return sqe;
 }
 
 static int fuse_uring_prepare_fetch_sqes(struct fuse_ring_queue *queue)
@@ -428,32 +504,7 @@ static int fuse_uring_prepare_fetch_sqes(struct fuse_ring_queue *queue)
 
 	for (size_t idx = 0; idx < ring_pool->queue_depth; idx++) {
 		struct fuse_ring_ent *ent = &queue->ent[idx];
-
-		sqe = io_uring_get_sqe(&queue->ring);
-		if (sqe == NULL) {
-			/* All SQEs are idle here - no good reason this
-			 * could fail
-			 */
-
-			fuse_log(FUSE_LOG_ERR, "Failed to get all ring SQEs");
-			return -EIO;
-		}
-
-		fuse_uring_sqe_prepare(sqe, ent, FUSE_IO_URING_CMD_REGISTER);
-
-		/* only needed for fetch */
-		ent->iov[0].iov_base = ent->req_header;
-		ent->iov[0].iov_len = queue->req_header_sz;
-
-		ent->iov[1].iov_base = ent->op_payload;
-		ent->iov[1].iov_len = ent->req_payload_sz;
-
-		sqe->addr = (uint64_t)(ent->iov);
-		sqe->len = 2;
-
-		/* this is a fetch, kernel does not read commit id */
-		fuse_uring_sqe_set_req_data(fuse_uring_get_sqe_cmd(sqe),
-					    queue->qid, 0);
+		fuse_sqe_register(queue, ent);
 	}
 
 	sq_ready = io_uring_sq_ready(&queue->ring);
@@ -577,6 +628,38 @@ static void fuse_uring_handle_cqe(struct fuse_ring_queue *queue,
 				       ent->op_payload, ent_in_out->payload_sz);
 }
 
+static void fuse_ent_retry(struct io_uring_cqe *cqe)
+{
+	struct fuse_ring_ent *ent = io_uring_cqe_get_data(cqe);
+	struct fuse_ring_queue *queue = ent->ring_queue;
+	struct io_uring_sqe *sqe;
+
+	/* nothing we can really do */
+	if (!ent || !ent->is_fixed_buffer)
+		return;
+
+	ent->is_fixed_buffer = false;
+
+	/* retry with user addresses instead of fixed buffers */
+	ent->req_header =
+		numa_alloc_local(queue->req_header_sz);
+
+	ent->iov[0].iov_base = ent->req_header;
+	ent->iov[0].iov_len = queue->req_header_sz;
+
+	ent->iov[1].iov_base = ent->op_payload;
+	ent->iov[1].iov_len = ent->req_payload_sz;
+
+	sqe = fuse_sqe_register(queue, ent);
+	if (!sqe)
+		return;
+
+	sqe->addr = (uint64_t)(ent->iov);
+	sqe->len = 2;
+
+	io_uring_submit(&queue->ring);
+}
+
 static int fuse_uring_queue_handle_cqes(struct fuse_ring_queue *queue)
 {
 	struct fuse_ring_pool *ring_pool = queue->ring_pool;
@@ -601,6 +684,9 @@ static int fuse_uring_queue_handle_cqes(struct fuse_ring_queue *queue)
 
 			// XXX: Needs rate limited logs, otherwise log spam
 			//fuse_log(FUSE_LOG_ERR, "cqe res: %d\n", cqe->res);
+
+			if (err == -EINVAL)
+				fuse_ent_retry(cqe);
 
 			/* -ENOTCONN is ok on umount  */
 			if (err != -EINTR && err != -EAGAIN &&
@@ -664,6 +750,7 @@ static int fuse_uring_init_queue(struct fuse_ring_queue *queue)
 	struct fuse_session *se = ring->se;
 	int res;
 	size_t page_sz = sysconf(_SC_PAGESIZE);
+	struct iovec *buffer_iovs = NULL;
 
 	queue->eventfd = eventfd(0, EFD_CLOEXEC);
 	if (queue->eventfd < 0) {
@@ -674,32 +761,28 @@ static int fuse_uring_init_queue(struct fuse_ring_queue *queue)
 		return res;
 	}
 
-	res = fuse_queue_setup_io_uring(queue);
+	queue->req_header_sz = ROUND_UP(sizeof(struct fuse_ring_ent),
+				       page_sz);
+
+	res = fuse_queue_setup_io_uring(queue, &buffer_iovs);
 	if (res != 0) {
 		fuse_log(FUSE_LOG_ERR, "qid=%d io_uring init failed\n",
 			 queue->qid);
 		goto err;
 	}
 
-	queue->req_header_sz = ROUND_UP(sizeof(struct fuse_ring_ent),
-				       page_sz);
-
 	for (size_t idx = 0; idx < ring->queue_depth; idx++) {
 		struct fuse_ring_ent *ent = &queue->ent[idx];
 		struct fuse_req *req = &ent->req;
 
 		ent->ring_queue = queue;
-
-		/*
-		 * Also allocate the header to have it page aligned, which
-		 * is a requirement for page pinning
-		 */
-		ent->req_header =
-			numa_alloc_local(queue->req_header_sz);
 		ent->req_payload_sz = ring->max_req_payload_sz;
-
-		ent->op_payload =
-			numa_alloc_local(ent->req_payload_sz);
+		ent->req_payload_sz = buffer_iovs[idx].iov_len;
+		ent->op_payload = buffer_iovs[idx].iov_base;
+		ent->req_header = ent->op_payload + ent->req_payload_sz -
+			sizeof(*ent->req_header);
+		ent->buf_index = idx;
+		ent->is_fixed_buffer = true;
 
 		req->se = se;
 		pthread_mutex_init(&req->lock, NULL);
@@ -707,6 +790,8 @@ static int fuse_uring_init_queue(struct fuse_ring_queue *queue)
 		req->ref_cnt = 1; /* extra ref to avoid destruction */
 		list_init_req(req);
 	}
+
+	free(buffer_iovs);
 
 	res = fuse_uring_prepare_fetch_sqes(queue);
 	if (res != 0) {
