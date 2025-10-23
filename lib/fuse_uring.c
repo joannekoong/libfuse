@@ -685,21 +685,21 @@ static int fuse_uring_init_queue(struct fuse_ring_queue *queue)
 				       page_sz);
 
 	for (size_t idx = 0; idx < ring->queue_depth; idx++) {
-		struct fuse_ring_ent *ring_ent = &queue->ent[idx];
-		struct fuse_req *req = &ring_ent->req;
+		struct fuse_ring_ent *ent = &queue->ent[idx];
+		struct fuse_req *req = &ent->req;
 
-		ring_ent->ring_queue = queue;
+		ent->ring_queue = queue;
 
 		/*
 		 * Also allocate the header to have it page aligned, which
 		 * is a requirement for page pinning
 		 */
-		ring_ent->req_header =
+		ent->req_header =
 			numa_alloc_local(queue->req_header_sz);
-		ring_ent->req_payload_sz = ring->max_req_payload_sz;
+		ent->req_payload_sz = ring->max_req_payload_sz;
 
-		ring_ent->op_payload =
-			numa_alloc_local(ring_ent->req_payload_sz);
+		ent->op_payload =
+			numa_alloc_local(ent->req_payload_sz);
 
 		req->se = se;
 		pthread_mutex_init(&req->lock, NULL);
