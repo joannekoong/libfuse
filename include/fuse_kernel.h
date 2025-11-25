@@ -239,6 +239,9 @@
  *  7.45
  *  - add FUSE_COPY_FILE_RANGE_64
  *  - add struct fuse_copy_file_range_out
+ *
+ *  7.46
+ *  - add fuse_uring_cmd_req init flags and queue_depth
  */
 
 #ifndef _LINUX_FUSE_H
@@ -1255,7 +1258,9 @@ struct fuse_uring_ent_in_out {
 
 	/* size of user payload buffer */
 	uint32_t payload_sz;
-	uint32_t padding;
+
+	uint16_t buf_id;
+	uint16_t padding;
 
 	uint64_t reserved;
 };
@@ -1286,6 +1291,12 @@ enum fuse_uring_cmd {
 	FUSE_IO_URING_CMD_COMMIT_AND_FETCH = 2,
 };
 
+/* fuse_uring_cmd_req flags */
+#define FUSE_URING_BUF_RING             (1 << 0)
+#define FUSE_URING_PINNED_HEADERS       (1 << 1)
+#define FUSE_URING_PINNED_BUFFERS       (1 << 2)
+#define FUSE_URING_ZERO_COPY            (1 << 3)
+
 /**
  * In the 80B command area of the SQE.
  */
@@ -1297,7 +1308,15 @@ struct fuse_uring_cmd_req {
 
 	/* queue the command is for (queue index) */
 	uint16_t qid;
-	uint8_t padding[6];
+	uint16_t padding;
+
+	union {
+	    struct {
+		    uint32_t buf_size;
+		    uint16_t queue_depth;
+		    uint16_t padding;
+	    } init;
+	};
 };
 
 #endif /* _LINUX_FUSE_H */
