@@ -1255,7 +1255,9 @@ struct fuse_uring_ent_in_out {
 
 	/* size of user payload buffer */
 	uint32_t payload_sz;
-	uint32_t padding;
+
+	uint16_t buf_id;
+	uint16_t padding;
 
 	uint64_t reserved;
 };
@@ -1286,6 +1288,11 @@ enum fuse_uring_cmd {
 	FUSE_IO_URING_CMD_COMMIT_AND_FETCH = 2,
 };
 
+/* fuse_uring_cmd_req flags */
+#define FUSE_URING_BUFPOOL              (1 << 0)
+#define FUSE_URING_REGISTERED_BUFFERS   (1 << 1)
+#define FUSE_URING_ZERO_COPY            (1 << 2)
+
 /**
  * In the 80B command area of the SQE.
  */
@@ -1297,7 +1304,17 @@ struct fuse_uring_cmd_req {
 
 	/* queue the command is for (queue index) */
 	uint16_t qid;
-	uint8_t padding[6];
+	uint16_t padding;
+	uint32_t reserved;
+
+	union {
+	    struct {
+		    uint32_t buf_size;
+		    uint16_t nr_bufs;
+
+		    uint16_t zero_copy_index;
+	    } init;
+	};
 };
 
 #endif /* _LINUX_FUSE_H */

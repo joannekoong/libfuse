@@ -3789,6 +3789,9 @@ static const struct fuse_opt fuse_ll_opts[] = {
 	LL_OPTION("allow_root", deny_others, 1),
 	LL_OPTION("io_uring", uring.enable, 1),
 	LL_OPTION("io_uring_q_depth=%u", uring.q_depth, -1),
+	LL_OPTION("io_uring_bufpool", uring.use_bufpool, 1),
+	LL_OPTION("io_uring_registered_buffers", uring.use_registered_buffers, 1),
+	LL_OPTION("io_uring_zero_copy", uring.use_zero_copy, 1),
 	FUSE_OPT_END
 };
 
@@ -3809,6 +3812,9 @@ void fuse_lowlevel_help(void)
 "    -o auto_unmount        auto unmount on process termination\n"
 "    -o io_uring            enable io-uring\n"
 "    -o io_uring_q_depth=<n> io-uring queue depth\n"
+"    -o io_uring_bufpool    use io-uring bufpool\n"
+"    -o io_uring_registered_buffers   use io-uring registered buffers\n"
+"    -o io_uring_zero_copy  use io-uring zero-copy (needs super privileges)\n"
 );
 }
 
@@ -4165,6 +4171,18 @@ fuse_session_new_versioned(struct fuse_args *args,
 	/* Parse options */
 	if(fuse_opt_parse(args, se, fuse_ll_opts, NULL) == -1)
 		goto out2;
+
+	if (se->uring.use_zero_copy) {
+		se->uring.enable = true;
+		se->uring.use_registered_buffers = true;
+		se->uring.use_bufpool = true;
+	} else if (se->uring.use_registered_buffers) {
+		se->uring.enable = true;
+		se->uring.use_bufpool = true;
+	} else if (se->uring.use_bufpool) {
+		se->uring.enable = true;
+	}
+
 	if(se->deny_others) {
 		/* Allowing access only by root is done by instructing
 		 * kernel to allow access by everyone, and then restricting
@@ -4489,4 +4507,10 @@ int fuse_session_exited(struct fuse_session *se)
 		atomic_load_explicit(&se->mt_exited, memory_order_relaxed);
 
 	return exited ? 1 : 0;
+}
+
+int fuse_do_zero_copy(fuse_req_t req, int fd, void *buf, off_t off,
+		      size_t len, bool read)
+{
+	return fuse_uring_do_zero_copy(req, fd, buf, off, len, read);
 }

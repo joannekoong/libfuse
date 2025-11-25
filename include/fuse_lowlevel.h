@@ -2385,6 +2385,8 @@ bool fuse_req_is_uring(fuse_req_t req);
 int fuse_req_get_payload(fuse_req_t req, char **payload, size_t *payload_sz,
 			 void **mr);
 
+int fuse_do_zero_copy(fuse_req_t req, int fd, void *buf, off_t off, size_t len, bool read);
+
 #ifdef __cplusplus
 }
 #endif
