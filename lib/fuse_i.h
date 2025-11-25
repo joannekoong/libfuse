@@ -42,6 +42,7 @@ struct fuse_req {
 		unsigned int ioctl_64bit : 1;
 		unsigned int is_uring : 1;
 		unsigned int is_copy_file_range_64 : 1;
+		unsigned int is_zero_copied : 1;
 	} flags;
 	union {
 		struct {
@@ -66,6 +67,8 @@ struct fuse_notify_req {
 
 struct fuse_session_uring {
 	bool enable;
+	bool use_bufring;
+	bool use_zero_copy;
 	unsigned int q_depth;
 	struct fuse_ring_pool *pool;
 };

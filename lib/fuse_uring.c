@@ -28,9 +28,16 @@
 #include <linux/sched.h>
 #include <poll.h>
 #include <sys/eventfd.h>
+#include <sys/mman.h>
 
 /* Size of command data area in SQE when IORING_SETUP_SQE128 is used */
 #define FUSE_URING_MAX_SQE128_CMD_DATA 80
+
+/* Used when bufring or zero-copy is enabled */
+#define FUSE_URING_DEFAULT_ZERO_COPY_PAYLOAD_SIZE 0x10000
+#define FUSE_URING_DEFAULT_BUFRING_PAYLOAD_SIZE 0x100000
+#define FUSE_URING_DEFAULT_BUFRING_ENTRIES 8
+#define FUSE_URING_BUFRING_GROUP_ID 0
 
 struct fuse_ring_ent {
 	struct fuse_ring_queue *ring_queue; /* back pointer */
@@ -45,6 +52,11 @@ struct fuse_ring_ent {
 
 	/* header and payload */
 	struct iovec iov[2];
+
+	/* below fields are only used for bufring / zero-copy */
+	uint16_t buf_index;
+	bool cmd_in_flight;
+	bool cmd_write;
 };
 
 struct fuse_ring_queue {
@@ -56,6 +68,11 @@ struct fuse_ring_queue {
 	int eventfd;
 	size_t req_header_sz;
 	struct io_uring ring;
+
+	/* below fields are o nly used for bufring / zero-copy */
+	void *headers;
+	void *payload_addr;
+	size_t payload_size;
 
 	/* size depends on queue depth */
 	struct fuse_ring_ent ent[];
@@ -117,13 +134,35 @@ static void *fuse_uring_get_sqe_cmd(struct io_uring_sqe *sqe)
 	return (void *)&sqe->cmd[0];
 }
 
-static void fuse_uring_sqe_set_req_data(struct fuse_uring_cmd_req *req,
-					const unsigned int qid,
+static bool fuse_uring_use_bufring(struct fuse_ring_queue *queue)
+{
+    return queue->ring_pool->se->uring.use_bufring;
+}
+
+static bool fuse_uring_use_zero_copy(struct fuse_ring_queue *queue)
+{
+    return queue->ring_pool->se->uring.use_zero_copy;
+}
+
+static void fuse_uring_sqe_set_req_data(struct io_uring_sqe *sqe,
+					struct fuse_ring_queue *queue,
 					const unsigned int commit_id)
 {
-	req->qid = qid;
+	struct fuse_uring_cmd_req *req = fuse_uring_get_sqe_cmd(sqe);
+
+	req->qid = queue->qid;
 	req->commit_id = commit_id;
 	req->flags = 0;
+
+	if (sqe->cmd_op == FUSE_IO_URING_CMD_REGISTER) {
+		if (fuse_uring_use_bufring(queue))
+			req->flags |= FUSE_URING_BUF_RING;
+		if (fuse_uring_use_zero_copy(queue))
+			req->flags |= FUSE_URING_ZERO_COPY;
+		/* + 1 for the eventfd poll sqe, see fuse_queue_setup_io_uring */
+		req->init.queue_depth = queue->ring_pool->queue_depth + 1;
+		req->init.headers_offset = 0;
+	}
 }
 
 static void
@@ -143,6 +182,12 @@ fuse_uring_sqe_prepare(struct io_uring_sqe *sqe, struct fuse_ring_ent *req,
 	sqe->rw_flags = 0;
 	sqe->ioprio = 0;
 	sqe->off = 0;
+
+	if (fuse_uring_use_bufring(req->ring_queue) ||
+	    fuse_uring_use_zero_copy(req->ring_queue)) {
+		sqe->buf_index = req->buf_index;
+		sqe->uring_cmd_flags = IORING_URING_CMD_FIXED;
+	}
 
 	io_uring_sqe_set_data(sqe, req);
 
@@ -177,8 +222,7 @@ static int fuse_uring_commit_sqe(struct fuse_ring_pool *ring_pool,
 	fuse_uring_sqe_prepare(sqe, ring_ent,
 			       FUSE_IO_URING_CMD_COMMIT_AND_FETCH);
 
-	fuse_uring_sqe_set_req_data(fuse_uring_get_sqe_cmd(sqe), queue->qid,
-				    ring_ent->req_commit_id);
+	fuse_uring_sqe_set_req_data(sqe, queue, ring_ent->req_commit_id);
 
 	if (se->debug) {
 		fuse_log(FUSE_LOG_DEBUG, "    unique: %" PRIu64 ", result=%d\n",
@@ -325,7 +369,60 @@ int fuse_send_msg_uring(fuse_req_t req, struct iovec *iov, int count)
 	return fuse_uring_commit_sqe(ring_pool, queue, ring_ent);
 }
 
-static int fuse_queue_setup_io_uring(struct io_uring *ring, size_t qid,
+static int fuse_uring_bufring_setup(struct fuse_ring_queue *queue,
+				    size_t depth)
+{
+	size_t page_sz = sysconf(_SC_PAGESIZE);
+	struct io_uring *ring = &queue->ring;
+	int headers_len = depth * sizeof(struct fuse_uring_req_header);
+	struct io_uring_region_desc desc = {
+		.size = ROUND_UP(headers_len, page_sz),
+	};
+	struct io_uring_mem_region_reg mem_reg = {
+		.region_uptr =  (__u64)(uintptr_t)&desc,
+	};
+	void *addr;
+	int err;
+
+	if (fuse_uring_use_zero_copy(queue))
+		queue->payload_size = FUSE_URING_DEFAULT_ZERO_COPY_PAYLOAD_SIZE;
+	else
+		queue->payload_size = FUSE_URING_DEFAULT_BUFRING_PAYLOAD_SIZE;
+
+	addr = io_uring_setup_buf_ring_kernel_managed(ring, queue->payload_size,
+						      FUSE_URING_DEFAULT_BUFRING_ENTRIES,
+						      FUSE_URING_BUFRING_GROUP_ID, 0, &err);
+	if (!addr)
+		return -EINVAL;
+
+	queue->payload_addr = addr;
+
+	/* set up registered memory region for the headers */
+	err = io_uring_register_region(ring, &mem_reg);
+	if (err)
+		goto cleanup;
+
+	queue->headers = mmap(NULL, desc.size, PROT_READ | PROT_WRITE,
+			      MAP_SHARED | MAP_POPULATE, ring->ring_fd,
+			      desc.mmap_offset);
+	if (!queue->headers)
+		goto cleanup;
+
+	if (fuse_uring_use_zero_copy(queue)) {
+		err = io_uring_register_buffers_sparse(ring, depth);
+		if (err)
+			goto cleanup;
+	}
+
+	return 0;
+
+cleanup:
+	/* TODO: implement proper cleanup */
+	exit(1);
+}
+
+static int fuse_queue_setup_io_uring(struct fuse_ring_queue *queue,
+				     struct io_uring *ring, size_t qid,
 				     size_t depth, int fd, int evfd)
 {
 	int rc;
@@ -370,6 +467,17 @@ static int fuse_queue_setup_io_uring(struct io_uring *ring, size_t qid,
 		return rc;
 	}
 
+	if (fuse_uring_use_bufring(queue)) {
+		rc = fuse_uring_bufring_setup(queue, depth);
+		if (rc) {
+		    fuse_log(FUSE_LOG_ERR,
+			     "Failed to setup bufring for ring idx %zu: %s\n",
+			     qid, strerror(rc));
+		    io_uring_unregister_files(ring);
+		    return rc;
+		}
+	}
+
 	return 0;
 }
 
@@ -401,11 +509,13 @@ static void fuse_session_destruct_uring(struct fuse_ring_pool *fuse_ring)
 		if (queue->ring.ring_fd != -1)
 			io_uring_queue_exit(&queue->ring);
 
-		for (size_t idx = 0; idx < fuse_ring->queue_depth; idx++) {
-			struct fuse_ring_ent *ent = &queue->ent[idx];
+		if (!fuse_uring_use_bufring(queue)) {
+		    for (size_t idx = 0; idx < fuse_ring->queue_depth; idx++) {
+			    struct fuse_ring_ent *ent = &queue->ent[idx];
 
-			numa_free(ent->op_payload, ent->req_payload_sz);
-			numa_free(ent->req_header, queue->req_header_sz);
+			    numa_free(ent->op_payload, ent->req_payload_sz);
+			    numa_free(ent->req_header, queue->req_header_sz);
+		    }
 		}
 	}
 
@@ -447,8 +557,7 @@ static int fuse_uring_prepare_fetch_sqes(struct fuse_ring_queue *queue)
 		sqe->len = 2;
 
 		/* this is a fetch, kernel does not read commit id */
-		fuse_uring_sqe_set_req_data(fuse_uring_get_sqe_cmd(sqe),
-					    queue->qid, 0);
+		fuse_uring_sqe_set_req_data(sqe, queue, 0);
 	}
 
 	sq_ready = io_uring_sq_ready(&queue->ring);
@@ -532,10 +641,57 @@ err:
 	return NULL;
 }
 
+static int handle_inflight_cmd_cqe(struct fuse_ring_ent *ent,
+                                   struct io_uring_cqe *cqe)
+{
+       struct fuse_ring_queue *queue = ent->ring_queue;
+       struct fuse_ring_pool *ring_pool = queue->ring_pool;
+       struct fuse_uring_req_header *rrh = ent->req_header;
+       struct fuse_out_header *out = (struct fuse_out_header *)&rrh->in_out;
+       struct fuse_uring_ent_in_out *ent_in_out =
+               (struct fuse_uring_ent_in_out *)&rrh->ring_ent_in_out;
+
+       int res = cqe->res;
+
+       out->error  = res < 0 ? res : 0;
+       out->unique = ent->req.unique;
+
+       if (ent->cmd_write) {
+		struct fuse_write_out arg;
+		size_t max_payload_sz = ring_pool->max_req_payload_sz;
+
+		memset(&arg, 0, sizeof(arg));
+		arg.size = res > 0 ? res : 0;
+
+		size_t argsize = sizeof(arg);
+
+		if (argsize > max_payload_sz) {
+			fuse_log(FUSE_LOG_ERR, "argsize %zu exceeds buffer size %zu",
+				 argsize, max_payload_sz);
+			out->error = -EINVAL;
+		} else if (argsize) {
+			    memcpy(ent->op_payload, &arg, argsize);
+		}
+		ent_in_out->payload_sz = argsize;
+       } else {
+	       ent_in_out->payload_sz = res > 0 ? res : 0;
+       }
+
+       res = fuse_uring_commit_sqe(ring_pool, queue, ent);
+
+       fuse_free_req(&ent->req);
+
+       ent->cmd_in_flight = false;
+       ent->cmd_write = false;
+
+       return res;
+}
+
 static void fuse_uring_handle_cqe(struct fuse_ring_queue *queue,
 				  struct io_uring_cqe *cqe)
 {
 	struct fuse_ring_ent *ent = io_uring_cqe_get_data(cqe);
+	int buf_id;
 
 	if (!ent) {
 		fuse_log(FUSE_LOG_ERR,
@@ -549,6 +705,11 @@ static void fuse_uring_handle_cqe(struct fuse_ring_queue *queue,
 
 	struct fuse_in_header *in = (struct fuse_in_header *)&rrh->in_out;
 	struct fuse_uring_ent_in_out *ent_in_out = &rrh->ring_ent_in_out;
+
+	if (cqe->flags & IORING_CQE_F_BUFFER) {
+		buf_id = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
+		ent->op_payload = queue->payload_addr + (buf_id * queue->payload_size);
+	}
 
 	ent->req_commit_id = ent_in_out->commit_id;
 	if (unlikely(ent->req_commit_id == 0)) {
@@ -582,18 +743,22 @@ static int fuse_uring_queue_handle_cqes(struct fuse_ring_queue *queue)
 	int ret = 0;
 
 	io_uring_for_each_cqe(&queue->ring, head, cqe) {
+		struct fuse_ring_ent *ent = io_uring_cqe_get_data(cqe);
 		int err = 0;
 
 		num_completed++;
 
 		err = cqe->res;
-		if (err != 0) {
-			if (err > 0 && ((uintptr_t)io_uring_cqe_get_data(cqe) ==
-					(unsigned int)queue->eventfd)) {
-				/* teardown from eventfd */
-				return -ENOTCONN;
-			}
 
+		if (err > 0 && ((uintptr_t)io_uring_cqe_get_data(cqe) ==
+				(unsigned int)queue->eventfd)) {
+			/* teardown from eventfd */
+			return -ENOTCONN;
+		}
+
+		if (ent->cmd_in_flight) {
+		       err = handle_inflight_cmd_cqe(ent, cqe);
+		} else {
 			// XXX: Needs rate limited logs, otherwise log spam
 			//fuse_log(FUSE_LOG_ERR, "cqe res: %d\n", cqe->res);
 
@@ -606,8 +771,6 @@ static int fuse_uring_queue_handle_cqes(struct fuse_ring_queue *queue)
 				if (ret == 0)
 					ret = err;
 			}
-
-		} else {
 			fuse_uring_handle_cqe(queue, cqe);
 		}
 	}
@@ -669,7 +832,7 @@ static int fuse_uring_init_queue(struct fuse_ring_queue *queue)
 		return res;
 	}
 
-	res = fuse_queue_setup_io_uring(&queue->ring, queue->qid,
+	res = fuse_queue_setup_io_uring(queue, &queue->ring, queue->qid,
 					ring->queue_depth, se->fd,
 					queue->eventfd);
 	if (res != 0) {
@@ -686,17 +849,21 @@ static int fuse_uring_init_queue(struct fuse_ring_queue *queue)
 		struct fuse_req *req = &ring_ent->req;
 
 		ring_ent->ring_queue = queue;
-
-		/*
-		 * Also allocate the header to have it page aligned, which
-		 * is a requirement for page pinning
-		 */
-		ring_ent->req_header =
-			numa_alloc_local(queue->req_header_sz);
 		ring_ent->req_payload_sz = ring->max_req_payload_sz;
 
-		ring_ent->op_payload =
-			numa_alloc_local(ring_ent->req_payload_sz);
+		if (fuse_uring_use_bufring(queue)) {
+			ring_ent->req_header =
+				queue->headers + (idx * sizeof(struct fuse_uring_req_header));
+			ring_ent->buf_index = idx;
+		} else {
+			/*
+			 * Also allocate the header to have it page aligned, which
+			 * is a requirement for page pinning
+			 */
+			ring_ent->req_header = numa_alloc_local(queue->req_header_sz);
+			ring_ent->op_payload =
+				numa_alloc_local(ring_ent->req_payload_sz);
+		}
 
 		req->se = se;
 		pthread_mutex_init(&req->lock, NULL);
@@ -861,4 +1028,49 @@ void fuse_uring_wake_ring_threads(struct fuse_session *se)
 	/* Wake up the threads to let them send SQEs */
 	for (size_t qid = 0; qid < ring->nr_queues; qid++)
 		sem_post(&ring->init_sem);
+}
+
+int fuse_uring_do_zero_copy(fuse_req_t req, int fd, void *buf, off_t off, size_t len, bool read)
+{
+       struct fuse_ring_ent *ent;
+       struct io_uring_sqe *sqe;
+       int submitted;
+
+       /* Not possible without io-uring interface */
+       if (!req->flags.is_uring)
+               return -EINVAL;
+
+       ent = container_of(req, struct fuse_ring_ent, req);
+
+       /* get an sqe to use for reading from buf to req buf */
+       sqe = io_uring_get_sqe(&ent->ring_queue->ring);
+
+       if (!sqe)
+	       return -EAGAIN;
+
+       if (read) {
+	       if (buf) {
+		       int pipefd[2];
+		       pipe(pipefd);
+		       write(pipefd[1], buf, len);
+
+		       io_uring_prep_rw(IORING_OP_READ_FIXED, sqe, pipefd[0], 0, len, 0);
+	       } else {
+		       io_uring_prep_rw(IORING_OP_READ_FIXED, sqe, fd, 0, len, off);
+	       }
+       } else {
+	       io_uring_prep_rw(IORING_OP_WRITE_FIXED, sqe, fd, 0, len, off);
+	       ent->cmd_write = true;
+       }
+
+       sqe->buf_index = ent->buf_index;
+
+       io_uring_sqe_set_data(sqe, ent);
+       ent->cmd_in_flight = true;
+       submitted = io_uring_submit(&ent->ring_queue->ring);
+       if (submitted != 1) {
+	       return -errno;
+       }
+
+       return 0;
 }
