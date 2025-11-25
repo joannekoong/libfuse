@@ -31,6 +31,7 @@ void fuse_session_process_uring_cqe(struct fuse_session *se,
 
 struct fuse_in_header;
 
+int fuse_uring_do_zero_copy(fuse_req_t req, int fd, void *buf, off_t off, size_t len, bool read);
 int fuse_uring_start(struct fuse_session *se);
 void fuse_uring_wake_ring_threads(struct fuse_session *se);
 int fuse_uring_stop(struct fuse_session *se);
