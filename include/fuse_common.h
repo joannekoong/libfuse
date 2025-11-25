@@ -96,8 +96,10 @@ struct fuse_file_info {
 	    file */
 	uint32_t parallel_direct_writes : 1;
 
+	uint32_t zerocopy : 1;
+
 	/** Padding.  Reserved for future use*/
-	uint32_t padding : 23;
+	uint32_t padding : 22;
 	uint32_t padding2 : 32;
 	uint32_t padding3 : 32;
 

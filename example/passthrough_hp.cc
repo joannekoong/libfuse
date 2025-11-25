@@ -1077,6 +1077,9 @@ static void sfs_open(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi)
 		fi->flags |= O_RDWR;
 	}
 
+	if (fuse_should_do_zero_copy(req))
+		fi->zerocopy = true;
+
 	/* With writeback cache, O_APPEND is handled by the kernel.  This
 	 * breaks atomicity (since the file may change in the underlying
 	 * filesystem, so that the kernel's idea of the end of the file
@@ -1162,6 +1165,11 @@ static void do_read(fuse_req_t req, size_t size, off_t off, fuse_file_info *fi)
 	size_t payload_size = 0;
 	int res = fuse_req_get_payload(req, &payload, &payload_size, NULL);
 
+	if (fi->zerocopy) {
+		fuse_do_zero_copy(req, fi->fh, NULL, off, size, true);
+		return;
+	}
+
 	/*
 	 * This is a demonstration how to use io-uring payload. For FUSE_BUF_IS_FD
 	 * it shouldn't make much of a difference because fuse_reply_data() ->
@@ -1209,6 +1217,11 @@ static void sfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
 static void do_write_buf(fuse_req_t req, size_t size, off_t off,
 			 fuse_bufvec *in_buf, fuse_file_info *fi)
 {
+	if (fi->zerocopy) {
+		fuse_do_zero_copy(req, fi->fh, NULL, off, size, false);
+		return;
+	}
+
 	fuse_bufvec out_buf = FUSE_BUFVEC_INIT(size);
 	out_buf.buf[0].flags =
 		static_cast<fuse_buf_flags>(FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK);

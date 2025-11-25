@@ -1,5 +1,4 @@
-/*
-  FUSE: Filesystem in Userspace
+/* FUSE: Filesystem in Userspace
   Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
 
   Implementation of (most of) the low-level FUSE API. The session loop
@@ -501,6 +500,8 @@ static void fill_open(struct fuse_open_out *arg,
 		arg->open_flags |= FOPEN_NOFLUSH;
 	if (f->parallel_direct_writes)
 		arg->open_flags |= FOPEN_PARALLEL_DIRECT_WRITES;
+	if (f->zerocopy)
+		arg->open_flags |= FOPEN_IO_URING_ZERO_COPY;
 }
 
 int fuse_reply_entry(fuse_req_t req, const struct fuse_entry_param *e)
@@ -2956,19 +2957,6 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 	else if (arg->minor < 23)
 		outargsize = FUSE_COMPAT_22_INIT_OUT_SIZE;
 
-	/* XXX: Add an option to make non-available io-uring fatal */
-	if (enable_io_uring) {
-		int ring_rc = fuse_uring_start(se);
-
-		if (ring_rc != 0) {
-			fuse_log(FUSE_LOG_INFO,
-				 "fuse: failed to start io-uring: %s\n",
-				 strerror(ring_rc));
-			outargflags &= ~FUSE_OVER_IO_URING;
-			enable_io_uring = false;
-		}
-	}
-
 	/*
 	 * Has to be set before replying, as new kernel requests might
 	 * immediately arrive and got_init is used for op-code sanity.
@@ -2977,8 +2965,20 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 	 */
 	se->got_init = 1;
 	send_reply_ok(req, &outarg, outargsize);
-	if (enable_io_uring)
-		fuse_uring_wake_ring_threads(se);
+	if (enable_io_uring) {
+	    /* XXX: Add an option to make non-available io-uring fatal */
+		int ring_rc = fuse_uring_start(se);
+
+		if (ring_rc != 0) {
+			fuse_log(FUSE_LOG_INFO,
+				 "fuse: failed to start io-uring: %s\n",
+				 strerror(ring_rc));
+			outargflags &= ~FUSE_OVER_IO_URING;
+			enable_io_uring = false;
+		} else {
+		    fuse_uring_wake_ring_threads(se);
+		}
+	}
 }
 
 static __attribute__((no_sanitize("thread"))) void
@@ -3789,6 +3789,9 @@ static const struct fuse_opt fuse_ll_opts[] = {
 	LL_OPTION("allow_root", deny_others, 1),
 	LL_OPTION("io_uring", uring.enable, 1),
 	LL_OPTION("io_uring_q_depth=%u", uring.q_depth, -1),
+	LL_OPTION("io_uring_bufpool", uring.use_bufpool, 1),
+	LL_OPTION("io_uring_registered_buffers", uring.use_registered_buffers, 1),
+	LL_OPTION("io_uring_zero_copy", uring.use_zero_copy, 1),
 	FUSE_OPT_END
 };
 
@@ -3809,6 +3812,9 @@ void fuse_lowlevel_help(void)
 "    -o auto_unmount        auto unmount on process termination\n"
 "    -o io_uring            enable io-uring\n"
 "    -o io_uring_q_depth=<n> io-uring queue depth\n"
+"    -o io_uring_bufpool    use io-uring bufpool\n"
+"    -o io_uring_registered_buffers   use io-uring registered buffers\n"
+"    -o io_uring_zero_copy  use io-uring zero-copy (needs super privileges)\n"
 );
 }
 
@@ -4165,6 +4171,18 @@ fuse_session_new_versioned(struct fuse_args *args,
 	/* Parse options */
 	if(fuse_opt_parse(args, se, fuse_ll_opts, NULL) == -1)
 		goto out2;
+
+	if (se->uring.use_zero_copy) {
+		se->uring.enable = true;
+		se->uring.use_registered_buffers = true;
+		se->uring.use_bufpool = true;
+	} else if (se->uring.use_registered_buffers) {
+		se->uring.enable = true;
+		se->uring.use_bufpool = true;
+	} else if (se->uring.use_bufpool) {
+		se->uring.enable = true;
+	}
+
 	if(se->deny_others) {
 		/* Allowing access only by root is done by instructing
 		 * kernel to allow access by everyone, and then restricting
@@ -4489,4 +4507,15 @@ int fuse_session_exited(struct fuse_session *se)
 		atomic_load_explicit(&se->mt_exited, memory_order_relaxed);
 
 	return exited ? 1 : 0;
+}
+
+int fuse_do_zero_copy(fuse_req_t req, int fd, void *buf, off_t off,
+		      size_t len, bool read)
+{
+	return fuse_uring_do_zero_copy(req, fd, buf, off, len, read);
+}
+
+bool fuse_should_do_zero_copy(fuse_req_t req)
+{
+	return req->se->uring.use_zero_copy;
 }
