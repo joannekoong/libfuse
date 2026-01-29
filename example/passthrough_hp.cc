@@ -81,7 +81,15 @@
 
 #include "passthrough_helpers.h"
 
+#include <bpf/libbpf.h>
+#include <bpf/bpf.h>
+#include "famfs.skel.h"
+#include "famfs_common.h"
+
 using namespace std;
+
+static struct famfs_bpf *bpf_skel;
+static struct bpf_link *bpf_link;
 
 #define SFS_DEFAULT_THREADS "-1" // take libfuse value as default
 #define SFS_DEFAULT_CLONE_FD "0"
@@ -239,6 +247,8 @@ static void sfs_init(void *userdata, fuse_conn_info *conn)
 
 	/* Try a large IO by default */
 	conn->max_write = 4 * 1024 * 1024;
+
+	fuse_set_feature_flag(conn, FUSE_CAP_IOMAP);
 }
 
 static void sfs_getattr(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi)
@@ -1066,8 +1076,27 @@ static void sfs_fsyncdir(fuse_req_t req, fuse_ino_t ino, int datasync,
 	fuse_reply_err(req, res == -1 ? errno : 0);
 }
 
+/* Add inode's associated struct famfs_file_meta info to bpf map */
+static int bpf_map_add_famfs_file_meta(fuse_ino_t ino, struct famfs_file_meta *meta)
+{
+	int err;
+
+	err = bpf_map__update_elem(bpf_skel->maps.famfs_meta_hashmap,
+				   &ino, sizeof(ino),
+				   meta, sizeof(*meta),
+				   BPF_ANY);
+	if (err)
+		printf("bpf_map__update_elem failed with %d\n", err);
+
+	return err;
+}
+
 static void sfs_open(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi)
 {
+
+	struct famfs_file_meta meta = {};
+	int err;
+
 	Inode &inode = get_inode(ino);
 
 	/* With writeback cache, kernel may send read requests even
@@ -1109,6 +1138,29 @@ static void sfs_open(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi)
 	fi->fh = fd;
 	if (fs.passthrough)
 		do_passthrough_open(req, ino, fd, fi);
+
+	/*
+	 * In actual famfs server code, meta contains real values
+	 * Here in passthrough prototype, just use dummy values as an example
+	 */
+	meta.file_type = FUSE_FAMFS_FILE_REG;
+	meta.file_size = 128 * 1024;
+	meta.fm_extent_type = FUSE_FAMFS_EXT_SIMPLE;
+	meta.fm_nextents = 2;
+	meta.se[0].dev_index = 0;
+	meta.dev_bitmap |= (1 << meta.se[0].dev_index);
+	meta.se[0].ext_offset = 0;
+	meta.se[0].ext_len = 0;
+	meta.se[1].dev_index = 1;
+	meta.dev_bitmap |= (1 << meta.se[1].dev_index);
+	meta.se[1].ext_offset = 4096;
+	meta.se[1].ext_len = 8192;
+
+	err = bpf_map_add_famfs_file_meta(ino, &meta);
+	if (err)
+		printf("bpf_add_famfs_file_meta failed\n");
+	else
+		printf("bpf_add_famfs_file_meta succeeded\n");
 	fuse_reply_open(req, fi);
 }
 
@@ -1574,6 +1626,57 @@ static void maximize_fd_limit()
 		warn("WARNING: setrlimit() failed with");
 }
 
+static int bpf_setup(struct fuse_session *se)
+{
+	int err;
+
+	bpf_skel = famfs_bpf__open();
+	if (!bpf_skel) {
+		printf("failed to open BPF skel\n");
+		return -1;
+	}
+
+	/* set the dev_fd to the /dev/fuse fd */
+	bpf_skel->struct_ops.fuse_ops->dev_fd = fuse_session_fd(se);
+
+	/* now try to load it in */
+	err = famfs_bpf__load(bpf_skel);
+	if (err) {
+		printf("failed to load BPF skel: %d\n", err);
+		goto cleanup;
+	}
+
+	printf("bpf program load was successful\n");
+
+	bpf_link = bpf_map__attach_struct_ops(bpf_skel->maps.fuse_ops);
+	if (!bpf_link) {
+		err = -errno;
+		printf("failed to attach struct_ops: %s\n", strerror(-err));
+		goto cleanup;
+	}
+
+	printf("attached passthrough bpf prog successfully\n");
+	return 0;
+
+cleanup:
+	famfs_bpf__destroy(bpf_skel);
+	bpf_skel = NULL;
+	return err;
+}
+
+static void bpf_cleanup(void)
+{
+	if (bpf_link) {
+		bpf_link__destroy(bpf_link);
+		bpf_link = NULL;
+	}
+	if (bpf_skel) {
+		famfs_bpf__destroy(bpf_skel);
+		bpf_skel = NULL;
+	}
+	printf("detached bpf prog\n");
+}
+
 int main(int argc, char *argv[])
 {
 	struct fuse_loop_config *loop_config = NULL;
@@ -1644,6 +1747,10 @@ int main(int argc, char *argv[])
 		fuse_log_enable_syslog("passthrough-hp", LOG_PID | LOG_CONS,
 				       LOG_DAEMON);
 
+	printf("now setting up bpf...\n");
+	ret = bpf_setup(se);
+	printf("setting up bpf prog finished with err=%d\n", ret);
+
 	if (options.count("single"))
 		ret = fuse_session_loop(se);
 	else
@@ -1662,6 +1769,8 @@ err_out1:
 
 	if (!fs.foreground)
 		fuse_log_close_syslog();
+
+	bpf_cleanup();
 
 	return ret ? 1 : 0;
 }
