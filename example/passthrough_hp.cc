@@ -81,6 +81,10 @@
 
 #include "passthrough_helpers.h"
 
+#include <bpf/libbpf.h>
+#include <bpf/bpf.h>
+#include "passthrough_bpf.skel.h"
+
 using namespace std;
 
 #define SFS_DEFAULT_THREADS "-1" // take libfuse value as default
@@ -1574,6 +1578,54 @@ static void maximize_fd_limit()
 		warn("WARNING: setrlimit() failed with");
 }
 
+static struct passthrough_bpf_bpf *bpf_skel;
+static struct bpf_link *bpf_link;
+
+static int bpf_setup(void)
+{
+	int err;
+
+	bpf_skel = passthrough_bpf_bpf__open();
+	if (!bpf_skel) {
+		printf("failed to open BPF skel\n");
+		return -1;
+	}
+
+	err = passthrough_bpf_bpf__load(bpf_skel);
+	if (err) {
+		printf("failed to load BPF skel: %d\n", err);
+		goto cleanup;
+	}
+
+	bpf_link = bpf_map__attach_struct_ops(bpf_skel->maps.fuse_ops);
+	if (!bpf_link) {
+		err = -errno;
+		printf("failed to attach struct_ops: %s\n", strerror(-err));
+		goto cleanup;
+	}
+
+	printf("attached passthrough bpf prog successfully\n");
+	return 0;
+
+cleanup:
+	passthrough_bpf_bpf__destroy(bpf_skel);
+	bpf_skel = NULL;
+	return err;
+}
+
+static void bpf_cleanup(void)
+{
+	if (bpf_link) {
+		bpf_link__destroy(bpf_link);
+		bpf_link = NULL;
+	}
+	if (bpf_skel) {
+		passthrough_bpf_bpf__destroy(bpf_skel);
+		bpf_skel = NULL;
+	}
+	printf("detached bpf prog\n");
+}
+
 int main(int argc, char *argv[])
 {
 	struct fuse_loop_config *loop_config = NULL;
@@ -1644,6 +1696,10 @@ int main(int argc, char *argv[])
 		fuse_log_enable_syslog("passthrough-hp", LOG_PID | LOG_CONS,
 				       LOG_DAEMON);
 
+	printf("now setting up bpf...\n");
+	ret = bpf_setup();
+	printf("setting up bpf prog finished with err=%d\n", ret);
+
 	if (options.count("single"))
 		ret = fuse_session_loop(se);
 	else
@@ -1662,6 +1718,8 @@ err_out1:
 
 	if (!fs.foreground)
 		fuse_log_close_syslog();
+
+	bpf_cleanup();
 
 	return ret ? 1 : 0;
 }
