@@ -31,9 +31,15 @@ foreach ex : threaded_examples
                install: false)
 endforeach
 
+inc_dirs = include_directories('.')
+
+libbpf_dep = dependency('libbpf', required: true)
+libelf_dep = dependency('libelf', required: true)
+zlib_dep = dependency('zlib', required: true)
+
 if platform != 'dragonfly' and add_languages('cpp', required : false)
     executable('passthrough_hp', 'passthrough_hp.cc',
-               dependencies: [ thread_dep, libfuse_dep ],
+               dependencies: [ thread_dep, libfuse_dep, libbpf_dep, libelf_dep, zlib_dep ],
                install: false)
     executable('memfs_ll', 'memfs_ll.cc',
                dependencies: [ thread_dep, libfuse_dep ],
