@@ -512,6 +512,8 @@ struct fuse_loop_config_v1 {
  */
 #define FUSE_CAP_OVER_IO_URING (1UL << 31)
 
+#define FUSE_CAP_IOMAP (1UL << 32)
+
 /**
  * Ioctl flags
  *
