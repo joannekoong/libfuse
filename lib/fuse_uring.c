@@ -208,11 +208,18 @@ static int fuse_uring_commit_sqe(struct fuse_ring_pool *ring_pool,
 		 * There is no way to get out of SQEs, as the number of
 		 * SQEs matches the number tof requests.
 		 */
+	       if (!sqe) {
+		       io_uring_submit(&queue->ring);
+		       sqe = io_uring_get_sqe(&queue->ring);
+		       if (!sqe) {
+			    se->error = -EIO;
+			    fuse_log(FUSE_LOG_ERR, "Failed to get a ring SQEs\n");
 
-		se->error = -EIO;
-		fuse_log(FUSE_LOG_ERR, "Failed to get a ring SQEs\n");
+			    return -EIO;
+		       }
 
-		return -EIO;
+	       }
+
 	}
 
 	fuse_uring_sqe_prepare(sqe, ring_ent,
@@ -224,9 +231,6 @@ static int fuse_uring_commit_sqe(struct fuse_ring_pool *ring_pool,
 		fuse_log(FUSE_LOG_DEBUG, "    unique: %" PRIu64 ", result=%d\n",
 			 out->unique, ent_in_out->payload_sz);
 	}
-
-	/* XXX: This needs to be a ring config option */
-	io_uring_submit(&queue->ring);
 
 	return 0;
 }
@@ -763,6 +767,9 @@ static int fuse_uring_queue_handle_cqes(struct fuse_ring_queue *queue)
 	if (num_completed)
 		io_uring_cq_advance(&queue->ring, num_completed);
 
+	if (io_uring_sq_ready(&queue->ring))
+		io_uring_submit(&queue->ring);
+
 	return ret == 0 ? 0 : num_completed;
 }
 
@@ -1019,7 +1026,6 @@ int fuse_uring_do_zero_copy(fuse_req_t req, int fd, void *buf, off_t off, size_t
 {
        struct fuse_ring_ent *ent;
        struct io_uring_sqe *sqe;
-       int submitted;
 
        /* Not possible without io-uring interface */
        if (!req->flags.is_uring)
@@ -1030,8 +1036,12 @@ int fuse_uring_do_zero_copy(fuse_req_t req, int fd, void *buf, off_t off, size_t
        /* get an sqe to use for reading from buf to req buf */
        sqe = io_uring_get_sqe(&ent->ring_queue->ring);
 
-       if (!sqe)
-	       return -EAGAIN;
+       if (!sqe) {
+	       io_uring_submit(&ent->ring_queue->ring);
+	       sqe = io_uring_get_sqe(&ent->ring_queue->ring);
+	       if (!sqe)
+		   return -EAGAIN;
+       }
 
        if (read) {
 	       if (buf) {
@@ -1052,10 +1062,6 @@ int fuse_uring_do_zero_copy(fuse_req_t req, int fd, void *buf, off_t off, size_t
 
        io_uring_sqe_set_data(sqe, ent);
        ent->cmd_in_flight = true;
-       submitted = io_uring_submit(&ent->ring_queue->ring);
-       if (submitted != 1) {
-	       return -errno;
-       }
 
        return 0;
 }
