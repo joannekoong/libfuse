@@ -495,6 +495,7 @@ struct fuse_file_lock {
 #define FUSE_ALLOW_IDMAP	(1ULL << 40)
 #define FUSE_OVER_IO_URING	(1ULL << 41)
 #define FUSE_REQUEST_TIMEOUT	(1ULL << 42)
+#define FUSE_PASSTHROUGH_INO    (1ULL << 43)
 
 /**
  * CUSE INIT request/reply flags
@@ -698,6 +699,19 @@ struct fuse_entry_out {
 	uint32_t	entry_valid_nsec;
 	uint32_t	attr_valid_nsec;
 	struct fuse_attr attr;
+};
+
+struct fuse_entry2_out {
+        uint64_t        nodeid;
+        uint64_t        generation;
+        uint64_t        entry_valid;
+        uint64_t        attr_valid;
+        uint32_t        entry_valid_nsec;
+        uint32_t        attr_valid_nsec;
+        int32_t         backing_id;
+        uint32_t        flags;
+        uint64_t        reserved;
+        struct fuse_statx statx;
 };
 
 struct fuse_forget_in {
@@ -1129,7 +1143,7 @@ struct fuse_notify_prune_out {
 struct fuse_backing_map {
 	int32_t		fd;
 	uint32_t	flags;
-	uint64_t	padding;
+	uint64_t 	ops_mask;
 };
 
 /* Device ioctls: */
@@ -1306,5 +1320,16 @@ struct fuse_uring_cmd_req {
 	uint16_t qid;
 	uint8_t padding[6];
 };
+
+#define FUSE_PASSTHROUGH_OP(op)	(1ULL << ((op) - 1))
+
+/* op bits for fuse_backing_map ops_mask */
+#define FUSE_PASSTHROUGH_OP_READ	FUSE_PASSTHROUGH_OP(FUSE_READ)
+#define FUSE_PASSTHROUGH_OP_WRITE	FUSE_PASSTHROUGH_OP(FUSE_WRITE)
+#define FUSE_PASSTHROUGH_OP_READDIR	FUSE_PASSTHROUGH_OP(FUSE_READDIR)
+#define FUSE_PASSTHROUGH_OP_GETATTR	FUSE_PASSTHROUGH_OP(FUSE_GETATTR)
+#define FUSE_PASSTHROUGH_OP_SETATTR	FUSE_PASSTHROUGH_OP(FUSE_SETATTR)
+#define FUSE_PASSTHROUGH_OP_STATX	FUSE_PASSTHROUGH_OP(FUSE_STATX)
+#define FUSE_PASSTHROUGH_OP_OPEN 	FUSE_PASSTHROUGH_OP(FUSE_OPEN)
 
 #endif /* _LINUX_FUSE_H */

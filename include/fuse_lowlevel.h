@@ -1409,6 +1409,8 @@ void fuse_reply_none(fuse_req_t req);
  */
 int fuse_reply_entry(fuse_req_t req, const struct fuse_entry_param *e);
 
+int fuse_reply_entry2(fuse_req_t req, const struct fuse_entry_param *e, int backing_id);
+
 /**
  * Reply with a directory entry and open parameters
  *

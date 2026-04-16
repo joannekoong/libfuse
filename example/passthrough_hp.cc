@@ -361,7 +361,8 @@ static void sfs_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
 	do_setattr(req, ino, attr, valid, fi);
 }
 
-static int do_lookup(fuse_ino_t parent, const char *name, fuse_entry_param *e)
+static int do_lookup(fuse_req_t req, fuse_ino_t parent, const char *name,
+		      fuse_entry_param *e, int *backing_id)
 {
 	if (fs.debug)
 		cerr << "DEBUG: lookup(): name=" << name
@@ -426,6 +427,9 @@ static int do_lookup(fuse_ino_t parent, const char *name, fuse_entry_param *e)
 			     << "inode " << inode.src_ino << " count "
 			     << inode.nlookup << endl;
 
+		if (backing_id)
+			*backing_id = inode.backing_id;
+
 		fs_lock.unlock();
 		close(newfd);
 	} else { // no existing inode
@@ -445,6 +449,12 @@ static int do_lookup(fuse_ino_t parent, const char *name, fuse_entry_param *e)
 			     << inode.nlookup << endl;
 
 		inode.fd = newfd;
+
+		if (backing_id) {
+			*backing_id = fuse_passthrough_open(req, inode.fd);
+			inode.backing_id = *backing_id;
+		}
+
 		fs_lock.unlock();
 
 		if (fs.debug)
@@ -458,19 +468,20 @@ static int do_lookup(fuse_ino_t parent, const char *name, fuse_entry_param *e)
 static void sfs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
 {
 	fuse_entry_param e{};
-	auto err = do_lookup(parent, name, &e);
+	int backing_id = 0;
+	auto err = do_lookup(req, parent, name, &e, &backing_id);
 	if (err == ENOENT) {
 		e.attr_timeout = fs.timeout;
 		e.entry_timeout = fs.timeout;
 		e.ino = e.attr.st_ino = 0;
-		fuse_reply_entry(req, &e);
+		fuse_reply_entry2(req, &e, backing_id);
 	} else if (err) {
 		if (err == ENFILE || err == EMFILE)
 			cerr << "ERROR: Reached maximum number of file descriptors."
 			     << endl;
 		fuse_reply_err(req, err);
 	} else {
-		fuse_reply_entry(req, &e);
+		fuse_reply_entry2(req, &e, backing_id);
 	}
 }
 
@@ -492,7 +503,7 @@ static void mknod_symlink(fuse_req_t req, fuse_ino_t parent, const char *name,
 		goto out;
 
 	fuse_entry_param e;
-	saverr = do_lookup(parent, name, &e);
+	saverr = do_lookup(req, parent, name, &e, NULL);
 	if (saverr)
 		goto out;
 
@@ -593,7 +604,7 @@ static void sfs_unlink(fuse_req_t req, fuse_ino_t parent, const char *name)
 	// Skip this when inode has an open file and when writeback cache is enabled.
 	if (!fs.timeout) {
 		fuse_entry_param e;
-		auto err = do_lookup(parent, name, &e);
+		auto err = do_lookup(req, parent, name, &e, NULL);
 		if (err) {
 			fuse_reply_err(req, err);
 			return;
@@ -653,6 +664,20 @@ static void forget_one(fuse_ino_t ino, uint64_t n)
 
 static void sfs_forget(fuse_req_t req, fuse_ino_t ino, uint64_t nlookup)
 {
+	Inode &inode = get_inode(ino);
+
+	if (inode.backing_id) {
+		    if (fuse_passthrough_close(req, inode.backing_id) < 0) {
+			    cerr << "DEBUG: fuse_passthrough_close failed for inode "
+				 << ino << " backing file " << inode.backing_id
+				 << endl;
+		    } else if (fs.debug) {
+			    cerr << "DEBUG: closed backing file "
+				 << inode.backing_id << " for inode " << ino
+				 << endl;
+		    }
+		    inode.backing_id = 0;
+	}
 	forget_one(ino, nlookup);
 	fuse_reply_none(req);
 }
@@ -804,7 +829,7 @@ static void do_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
 				e.attr.st_ino = entry->d_ino;
 				e.attr.st_mode = entry->d_type << 12;
 			} else {
-				err = do_lookup(ino, entry->d_name, &e);
+				err = do_lookup(req, ino, entry->d_name, &e, NULL);
 				if (err)
 					goto error;
 				did_lookup = true;
@@ -951,7 +976,7 @@ static void sfs_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 
 	fi->fh = fd;
 	fuse_entry_param e;
-	auto err = do_lookup(parent, name, &e);
+	auto err = do_lookup(req, parent, name, &e, NULL);
 	if (err) {
 		if (err == ENFILE || err == EMFILE)
 			cerr << "ERROR: Reached maximum number of file descriptors."
@@ -1119,20 +1144,6 @@ static void sfs_release(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi)
 	Inode &inode = get_inode(ino);
 	lock_guard<mutex> g{ inode.m };
 	inode.nopen--;
-
-	/* Close the shared backing file on last file close of an inode */
-	if (inode.backing_id && !inode.nopen) {
-		if (fuse_passthrough_close(req, inode.backing_id) < 0) {
-			cerr << "DEBUG: fuse_passthrough_close failed for inode "
-			     << ino << " backing file " << inode.backing_id
-			     << endl;
-		} else if (fs.debug) {
-			cerr << "DEBUG: closed backing file "
-			     << inode.backing_id << " for inode " << ino
-			     << endl;
-		}
-		inode.backing_id = 0;
-	}
 
 	close(fi->fh);
 	fuse_reply_err(req, 0);

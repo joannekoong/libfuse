@@ -37,6 +37,7 @@
 #include <assert.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
+#include <sys/sysmacros.h>
 #include <stdalign.h>
 #include <poll.h>
 
@@ -125,6 +126,26 @@ static void trace_request_reply(uint64_t unique, unsigned int len,
 	(void)reply_err;
 }
 #endif
+
+static void convert_statx(const struct stat *stbuf, struct fuse_statx *statx)
+{
+	statx->ino	= stbuf->st_ino;
+	statx->mode	= stbuf->st_mode;
+	statx->nlink	= stbuf->st_nlink;
+	statx->uid	= stbuf->st_uid;
+	statx->gid	= stbuf->st_gid;
+	statx->rdev_major = major(stbuf->st_rdev);
+	statx->rdev_minor = minor(stbuf->st_rdev);
+	statx->size	= stbuf->st_size;
+	statx->blksize	= stbuf->st_blksize;
+	statx->blocks	= stbuf->st_blocks;
+	statx->atime.tv_sec  = stbuf->st_atim.tv_sec;
+	statx->atime.tv_nsec = stbuf->st_atim.tv_nsec;
+	statx->mtime.tv_sec  = stbuf->st_mtim.tv_sec;
+	statx->mtime.tv_nsec = stbuf->st_mtim.tv_nsec;
+	statx->ctime.tv_sec  = stbuf->st_ctim.tv_sec;
+	statx->ctime.tv_nsec = stbuf->st_ctim.tv_nsec;
+}
 
 static void convert_stat(const struct stat *stbuf, struct fuse_attr *attr)
 {
@@ -460,6 +481,19 @@ static unsigned int calc_timeout_nsec(double t)
 		return (unsigned int) (f * 1.0e9);
 }
 
+static void fill_entry2(struct fuse_entry2_out *arg,
+		       const struct fuse_entry_param *e, int backing_id)
+{
+	arg->nodeid = e->ino;
+	arg->generation = e->generation;
+	arg->entry_valid = calc_timeout_sec(e->entry_timeout);
+	arg->entry_valid_nsec = calc_timeout_nsec(e->entry_timeout);
+	arg->attr_valid = calc_timeout_sec(e->attr_timeout);
+	arg->attr_valid_nsec = calc_timeout_nsec(e->attr_timeout);
+	arg->backing_id = backing_id;
+	convert_statx(&e->attr, &arg->statx);
+}
+
 static void fill_entry(struct fuse_entry_out *arg,
 		       const struct fuse_entry_param *e)
 {
@@ -526,6 +560,16 @@ static void fill_open(struct fuse_open_out *arg,
 		arg->open_flags |= FOPEN_PARALLEL_DIRECT_WRITES;
 }
 
+int fuse_reply_entry2(fuse_req_t req, const struct fuse_entry_param *e,
+		      int backing_id)
+{
+	struct fuse_entry2_out arg;
+
+	memset(&arg, 0, sizeof(arg));
+	fill_entry2(&arg, e, backing_id);
+	return send_reply_ok(req, &arg, sizeof(arg));
+}
+
 int fuse_reply_entry(fuse_req_t req, const struct fuse_entry_param *e)
 {
 	struct fuse_entry_out arg;
@@ -580,7 +624,11 @@ int fuse_reply_readlink(fuse_req_t req, const char *linkname)
 
 int fuse_passthrough_open(fuse_req_t req, int fd)
 {
-	struct fuse_backing_map map = { .fd = fd };
+	uint64_t ops_mask =
+	    FUSE_PASSTHROUGH_OP_READ | FUSE_PASSTHROUGH_OP_WRITE |
+	    FUSE_PASSTHROUGH_OP_GETATTR | FUSE_PASSTHROUGH_OP_SETATTR |
+	    FUSE_PASSTHROUGH_OP_OPEN;
+	struct fuse_backing_map map = { .fd = fd, .ops_mask = ops_mask };
 	int ret;
 
 	ret = ioctl(req->se->fd, FUSE_DEV_IOC_BACKING_OPEN, &map);
@@ -2955,6 +3003,8 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 		outarg.request_timeout = se->conn.request_timeout;
 	}
 
+	outargflags |= FUSE_PASSTHROUGH_INO;
+
 	outarg.max_readahead = se->conn.max_readahead;
 	outarg.max_write = se->conn.max_write;
 	if (se->conn.proto_minor >= 13) {
@@ -3701,13 +3751,13 @@ void fuse_session_process_buf_internal(struct fuse_session *se,
 
 	trace_request_process(in->opcode, in->unique);
 
-	if (se->debug) {
+//	if (se->debug) {
 		fuse_log(FUSE_LOG_DEBUG,
 			"dev unique: %llu, opcode: %s (%i), nodeid: %llu, insize: %zu, pid: %u\n",
 			(unsigned long long) in->unique,
 			opname((enum fuse_opcode) in->opcode), in->opcode,
 			(unsigned long long) in->nodeid, buf->size, in->pid);
-	}
+//	}
 
 	req = fuse_ll_alloc_req(se);
 	if (req == NULL) {

@@ -227,6 +227,7 @@ FUSE_3.19 {
 		fuse_session_start_teardown_watchdog;
 		fuse_session_stop_teardown_watchdog;
 		fuse_lowlevel_notify_prune;
+		fuse_reply_entry2;
 } FUSE_3.18;
 
 # Local Variables:
