@@ -37,6 +37,7 @@
 #include <assert.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
+#include <sys/sysmacros.h>
 #include <stdalign.h>
 #include <poll.h>
 
@@ -125,6 +126,26 @@ static void trace_request_reply(uint64_t unique, unsigned int len,
 	(void)reply_err;
 }
 #endif
+
+static void convert_statx(const struct stat *stbuf, struct fuse_statx *statx)
+{
+	statx->ino	= stbuf->st_ino;
+	statx->mode	= stbuf->st_mode;
+	statx->nlink	= stbuf->st_nlink;
+	statx->uid	= stbuf->st_uid;
+	statx->gid	= stbuf->st_gid;
+	statx->rdev_major = major(stbuf->st_rdev);
+	statx->rdev_minor = minor(stbuf->st_rdev);
+	statx->size	= stbuf->st_size;
+	statx->blksize	= stbuf->st_blksize;
+	statx->blocks	= stbuf->st_blocks;
+	statx->atime.tv_sec  = stbuf->st_atim.tv_sec;
+	statx->atime.tv_nsec = stbuf->st_atim.tv_nsec;
+	statx->mtime.tv_sec  = stbuf->st_mtim.tv_sec;
+	statx->mtime.tv_nsec = stbuf->st_mtim.tv_nsec;
+	statx->ctime.tv_sec  = stbuf->st_ctim.tv_sec;
+	statx->ctime.tv_nsec = stbuf->st_ctim.tv_nsec;
+}
 
 static void convert_stat(const struct stat *stbuf, struct fuse_attr *attr)
 {
@@ -460,6 +481,19 @@ static unsigned int calc_timeout_nsec(double t)
 		return (unsigned int) (f * 1.0e9);
 }
 
+static void fill_entry2(struct fuse_entry2_out *arg,
+			const struct fuse_entry_param *e)
+{
+	arg->nodeid = e->ino;
+	arg->generation = e->generation;
+	arg->entry_valid = calc_timeout_sec(e->entry_timeout);
+	arg->entry_valid_nsec = calc_timeout_nsec(e->entry_timeout);
+	arg->attr_valid = calc_timeout_sec(e->attr_timeout);
+	arg->attr_valid_nsec = calc_timeout_nsec(e->attr_timeout);
+	arg->backing_id = e->backing_id;
+	convert_statx(&e->attr, &arg->statx);
+}
+
 static void fill_entry(struct fuse_entry_out *arg,
 		       const struct fuse_entry_param *e)
 {
@@ -528,34 +562,56 @@ static void fill_open(struct fuse_open_out *arg,
 
 int fuse_reply_entry(fuse_req_t req, const struct fuse_entry_param *e)
 {
-	struct fuse_entry_out arg;
-	size_t size = req->se->conn.proto_minor < 9 ?
-		FUSE_COMPAT_ENTRY_OUT_SIZE : sizeof(arg);
+	if (req->se->use_entry2) {
+		struct fuse_entry2_out arg;
 
-	/* before ABI 7.4 e->ino == 0 was invalid, only ENOENT meant
-	   negative entry */
-	if (!e->ino && req->se->conn.proto_minor < 4)
-		return fuse_reply_err(req, ENOENT);
+		memset(&arg, 0, sizeof(arg));
+		fill_entry2(&arg, e);
+		return send_reply_ok(req, &arg, sizeof(arg));
+	} else {
+		struct fuse_entry_out arg;
+		size_t arg_size = req->se->conn.proto_minor < 9 ?
+			FUSE_COMPAT_ENTRY_OUT_SIZE : sizeof(arg);
 
-	memset(&arg, 0, sizeof(arg));
-	fill_entry(&arg, e);
-	return send_reply_ok(req, &arg, size);
+		/* before ABI 7.4 e->ino == 0 was invalid, only ENOENT meant
+		   negative entry */
+		if (!e->ino && req->se->conn.proto_minor < 4)
+			return fuse_reply_err(req, ENOENT);
+
+		memset(&arg, 0, sizeof(arg));
+		fill_entry(&arg, e);
+		return send_reply_ok(req, &arg, arg_size);
+	}
 }
 
 int fuse_reply_create(fuse_req_t req, const struct fuse_entry_param *e,
 		      const struct fuse_file_info *f)
 {
-	alignas(uint64_t) char buf[sizeof(struct fuse_entry_out) + sizeof(struct fuse_open_out)];
-	size_t entrysize = req->se->conn.proto_minor < 9 ?
-		FUSE_COMPAT_ENTRY_OUT_SIZE : sizeof(struct fuse_entry_out);
-	struct fuse_entry_out *earg = (struct fuse_entry_out *) buf;
-	struct fuse_open_out *oarg = (struct fuse_open_out *) (buf + entrysize);
+	if (req->se->use_entry2) {
+		alignas(uint64_t) char buf[sizeof(struct fuse_entry2_out) + sizeof(struct fuse_open_out)];
+		size_t entrysize = req->se->conn.proto_minor < 9 ?
+			FUSE_COMPAT_ENTRY_OUT_SIZE : sizeof(struct fuse_entry2_out);
+		struct fuse_entry2_out *earg = (struct fuse_entry2_out *) buf;
+		struct fuse_open_out *oarg = (struct fuse_open_out *) (buf + entrysize);
 
-	memset(buf, 0, sizeof(buf));
-	fill_entry(earg, e);
-	fill_open(oarg, f);
-	return send_reply_ok(req, buf,
-			     entrysize + sizeof(struct fuse_open_out));
+		memset(buf, 0, sizeof(buf));
+		fill_entry2(earg, e);
+		fill_open(oarg, f);
+		return send_reply_ok(req, buf,
+				     entrysize + sizeof(struct fuse_open_out));
+	} else {
+		alignas(uint64_t) char buf[sizeof(struct fuse_entry_out) + sizeof(struct fuse_open_out)];
+		size_t entrysize = req->se->conn.proto_minor < 9 ?
+			FUSE_COMPAT_ENTRY_OUT_SIZE : sizeof(struct fuse_entry_out);
+		struct fuse_entry_out *earg = (struct fuse_entry_out *) buf;
+		struct fuse_open_out *oarg = (struct fuse_open_out *) (buf + entrysize);
+
+		memset(buf, 0, sizeof(buf));
+		fill_entry(earg, e);
+		fill_open(oarg, f);
+		return send_reply_ok(req, buf,
+				     entrysize + sizeof(struct fuse_open_out));
+	}
 }
 
 int fuse_reply_attr(fuse_req_t req, const struct stat *attr,
@@ -578,9 +634,9 @@ int fuse_reply_readlink(fuse_req_t req, const char *linkname)
 	return send_reply_ok(req, linkname, strlen(linkname));
 }
 
-int fuse_passthrough_open(fuse_req_t req, int fd)
+int fuse_passthrough_open(fuse_req_t req, int fd, uint64_t ops_mask)
 {
-	struct fuse_backing_map map = { .fd = fd };
+	struct fuse_backing_map map = { .fd = fd, .ops_mask = ops_mask };
 	int ret;
 
 	ret = ioctl(req->se->fd, FUSE_DEV_IOC_BACKING_OPEN, &map);
@@ -2954,6 +3010,10 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 		outargflags |= FUSE_REQUEST_TIMEOUT;
 		outarg.request_timeout = se->conn.request_timeout;
 	}
+
+	/* TODO: make this a cap flag */
+	outargflags |= FUSE_PASSTHROUGH_INO;
+	se->use_entry2 = true;
 
 	outarg.max_readahead = se->conn.max_readahead;
 	outarg.max_write = se->conn.max_write;

@@ -102,6 +102,8 @@ struct fuse_entry_param {
 	    that come through the kernel, this should be set to a very
 	    large value. */
 	double entry_timeout;
+
+	int32_t backing_id;
 };
 
 /**
@@ -1468,7 +1470,7 @@ int fuse_reply_readlink(fuse_req_t req, const char *link);
  * @param fd backing file descriptor
  * @return positive backing id for success, 0 for failure
  */
-int fuse_passthrough_open(fuse_req_t req, int fd);
+int fuse_passthrough_open(fuse_req_t req, int fd, uint64_t ops_mask);
 int fuse_passthrough_close(fuse_req_t req, int backing_id);
 
 /**

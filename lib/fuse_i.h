@@ -122,6 +122,7 @@ struct fuse_session {
 	 */
 	uint32_t conn_want;
 	uint64_t conn_want_ext;
+	bool use_entry2;
 };
 
 struct fuse_chan {

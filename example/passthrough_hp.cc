@@ -81,6 +81,7 @@
 #include <atomic>
 
 #include "passthrough_helpers.h"
+#include "fuse_kernel.h"
 
 using namespace std;
 
@@ -99,7 +100,13 @@ static_assert(sizeof(fuse_ino_t) >= sizeof(uint64_t),
 /* Forward declarations */
 struct Inode;
 static Inode &get_inode(fuse_ino_t ino);
-static void forget_one(fuse_ino_t ino, uint64_t n);
+static void forget_one(fuse_req_t req, fuse_ino_t ino, uint64_t n);
+
+const uint64_t passthrough_inode_ops =
+	    FUSE_PASSTHROUGH_OP_GETATTR | FUSE_PASSTHROUGH_OP_SETATTR;
+const uint64_t passthrough_rw_ops =
+	    FUSE_PASSTHROUGH_OP_READ | FUSE_PASSTHROUGH_OP_WRITE;
+const uint64_t passthrough_ops = passthrough_rw_ops | passthrough_inode_ops;
 
 // Uniquely identifies a file in the source directory tree. This could
 // be simplified to just ino_t since we require the source directory
@@ -172,6 +179,8 @@ struct Fs {
 	std::string fuse_mount_options;
 	bool direct_io;
 	bool passthrough;
+
+	std::unordered_map<ino_t, Inode*> ino_map; // protected by mutex
 };
 static Fs fs{};
 
@@ -184,12 +193,13 @@ static Inode &get_inode(fuse_ino_t ino)
 	if (ino == FUSE_ROOT_ID)
 		return fs.root;
 
-	Inode *inode = reinterpret_cast<Inode *>(ino);
-	if (inode->fd == -1) {
-		cerr << "INTERNAL ERROR: Unknown inode " << ino << endl;
-		abort();
+	lock_guard<mutex> g{fs.mutex};
+	auto it = fs.ino_map.find(ino);
+	if (it == fs.ino_map.end() || it->second->fd == -1) {
+	    cerr << "INTERNAL ERROR: Unknown inode " << ino << endl;
+	    abort();
 	}
-	return *inode;
+	return *it->second;
 }
 
 static int get_fs_fd(fuse_ino_t ino)
@@ -361,7 +371,8 @@ static void sfs_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
 	do_setattr(req, ino, attr, valid, fi);
 }
 
-static int do_lookup(fuse_ino_t parent, const char *name, fuse_entry_param *e)
+static int do_lookup(fuse_req_t req, fuse_ino_t parent, const char *name,
+		      fuse_entry_param *e, bool setup_backing)
 {
 	if (fs.debug)
 		cerr << "DEBUG: lookup(): name=" << name
@@ -402,7 +413,8 @@ static int do_lookup(fuse_ino_t parent, const char *name, fuse_entry_param *e)
 	} catch (std::bad_alloc &) {
 		return ENOMEM;
 	}
-	e->ino = reinterpret_cast<fuse_ino_t>(inode_p);
+	e->ino = e->attr.st_ino;
+
 	Inode &inode{ *inode_p };
 	e->generation = inode.generation;
 
@@ -426,6 +438,9 @@ static int do_lookup(fuse_ino_t parent, const char *name, fuse_entry_param *e)
 			     << "inode " << inode.src_ino << " count "
 			     << inode.nlookup << endl;
 
+		e->backing_id = inode.backing_id;
+
+		fs.ino_map[e->attr.st_ino] = inode_p;
 		fs_lock.unlock();
 		close(newfd);
 	} else { // no existing inode
@@ -445,6 +460,20 @@ static int do_lookup(fuse_ino_t parent, const char *name, fuse_entry_param *e)
 			     << inode.nlookup << endl;
 
 		inode.fd = newfd;
+
+		if (setup_backing && S_ISREG(e->attr.st_mode)) {
+			inode.backing_id = fuse_passthrough_open(req, inode.fd,
+								 passthrough_ops);
+			if (!inode.backing_id) {
+				cerr << "DEBUG: fuse_passthrough_open failed for " << name
+				     << ", disabling rw passthrough." << endl;
+				fs.passthrough = false;
+			}
+
+			e->backing_id = inode.backing_id;
+		}
+
+		fs.ino_map[e->attr.st_ino] = inode_p;
 		fs_lock.unlock();
 
 		if (fs.debug)
@@ -458,7 +487,7 @@ static int do_lookup(fuse_ino_t parent, const char *name, fuse_entry_param *e)
 static void sfs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
 {
 	fuse_entry_param e{};
-	auto err = do_lookup(parent, name, &e);
+	auto err = do_lookup(req, parent, name, &e, true);
 	if (err == ENOENT) {
 		e.attr_timeout = fs.timeout;
 		e.entry_timeout = fs.timeout;
@@ -492,7 +521,7 @@ static void mknod_symlink(fuse_req_t req, fuse_ino_t parent, const char *name,
 		goto out;
 
 	fuse_entry_param e;
-	saverr = do_lookup(parent, name, &e);
+	saverr = do_lookup(req, parent, name, &e, true);
 	if (saverr)
 		goto out;
 
@@ -549,9 +578,12 @@ static void sfs_link(fuse_req_t req, fuse_ino_t ino, fuse_ino_t parent,
 		fuse_reply_err(req, errno);
 		return;
 	}
-	e.ino = reinterpret_cast<fuse_ino_t>(&inode);
+	e.ino = e.attr.st_ino;
+	e.backing_id = inode.backing_id;
 	{
+		lock_guard<mutex> g{fs.mutex};
 		inode.nlookup++;
+		fs.ino_map[e.attr.st_ino] = &inode;
 		if (fs.debug)
 			cerr << "DEBUG:" << __func__ << ":" << __LINE__ << " "
 			     << "inode " << inode.src_ino << " count "
@@ -593,7 +625,7 @@ static void sfs_unlink(fuse_req_t req, fuse_ino_t parent, const char *name)
 	// Skip this when inode has an open file and when writeback cache is enabled.
 	if (!fs.timeout) {
 		fuse_entry_param e;
-		auto err = do_lookup(parent, name, &e);
+		auto err = do_lookup(req, parent, name, &e, true);
 		if (err) {
 			fuse_reply_err(req, err);
 			return;
@@ -614,13 +646,13 @@ static void sfs_unlink(fuse_req_t req, fuse_ino_t parent, const char *name)
 		}
 
 		// decrease the ref which lookup above had increased
-		forget_one(e.ino, 1);
+		forget_one(req, e.ino, 1);
 	}
 	auto res = unlinkat(inode_p.fd, name, 0);
 	fuse_reply_err(req, res == -1 ? errno : 0);
 }
 
-static void forget_one(fuse_ino_t ino, uint64_t n)
+static void forget_one(fuse_req_t req, fuse_ino_t ino, uint64_t n)
 {
 	Inode &inode = get_inode(ino);
 	unique_lock<mutex> l{ inode.m };
@@ -641,9 +673,22 @@ static void forget_one(fuse_ino_t ino, uint64_t n)
 		lock_guard<mutex> g_fs{ fs.mutex };
 		l.unlock();
 		if (!inode.nlookup) {
+			if (inode.backing_id) {
+				if (fuse_passthrough_close(req, inode.backing_id) < 0) {
+					cerr << "DEBUG: fuse_passthrough_close failed for inode "
+					     << ino << " backing file " << inode.backing_id
+					     << endl;
+				} else if (fs.debug) {
+					cerr << "DEBUG: closed backing file "
+					     << inode.backing_id << " for inode " << ino
+					     << endl;
+				}
+				inode.backing_id = 0;
+			}
 			if (fs.debug)
 				cerr << "DEBUG: forget: cleaning up inode "
 				     << inode.src_ino << endl;
+			fs.ino_map.erase(inode.src_ino);
 			fs.inodes.erase({ inode.src_ino, inode.src_dev });
 		}
 	} else if (fs.debug)
@@ -653,7 +698,7 @@ static void forget_one(fuse_ino_t ino, uint64_t n)
 
 static void sfs_forget(fuse_req_t req, fuse_ino_t ino, uint64_t nlookup)
 {
-	forget_one(ino, nlookup);
+	forget_one(req, ino, nlookup);
 	fuse_reply_none(req);
 }
 
@@ -661,7 +706,7 @@ static void sfs_forget_multi(fuse_req_t req, size_t count,
 			     fuse_forget_data *forgets)
 {
 	for (int i = 0; i < count; i++)
-		forget_one(forgets[i].ino, forgets[i].nlookup);
+		forget_one(req, forgets[i].ino, forgets[i].nlookup);
 	fuse_reply_none(req);
 }
 
@@ -804,7 +849,7 @@ static void do_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
 				e.attr.st_ino = entry->d_ino;
 				e.attr.st_mode = entry->d_type << 12;
 			} else {
-				err = do_lookup(ino, entry->d_name, &e);
+				err = do_lookup(req, ino, entry->d_name, &e, !plus);
 				if (err)
 					goto error;
 				did_lookup = true;
@@ -823,7 +868,7 @@ static void do_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
 				cerr << "DEBUG: readdir(): buffer full, returning data. "
 				     << endl;
 			if (did_lookup)
-				forget_one(e.ino, 1);
+				forget_one(req, e.ino, 1);
 			break;
 		}
 
@@ -891,7 +936,8 @@ static void do_passthrough_open(fuse_req_t req, fuse_ino_t ino, int fd,
 			     << inode.backing_id << " for inode " << ino
 			     << endl;
 		fi->backing_id = inode.backing_id;
-	} else if (!(inode.backing_id = fuse_passthrough_open(req, fd))) {
+	} else if (!(inode.backing_id =
+		     fuse_passthrough_open(req, fd, passthrough_rw_ops))) {
 		cerr << "DEBUG: fuse_passthrough_open failed for inode " << ino
 		     << ", disabling rw passthrough." << endl;
 		fs.passthrough = false;
@@ -951,7 +997,7 @@ static void sfs_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 
 	fi->fh = fd;
 	fuse_entry_param e;
-	auto err = do_lookup(parent, name, &e);
+	auto err = do_lookup(req, parent, name, &e, true);
 	if (err) {
 		if (err == ENFILE || err == EMFILE)
 			cerr << "ERROR: Reached maximum number of file descriptors."
@@ -968,6 +1014,7 @@ static void sfs_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 
 	if (fs.passthrough)
 		do_passthrough_open(req, e.ino, fd, fi);
+
 	fuse_reply_create(req, &e, fi);
 }
 
@@ -995,7 +1042,7 @@ static Inode *create_new_inode(int fd, fuse_entry_param *e)
 		return NULL;
 	}
 
-	e->ino = reinterpret_cast<fuse_ino_t>(p_inode);
+	e->ino = e->attr.st_ino;
 	e->generation = p_inode->generation;
 
 	lock_guard<mutex> g{ p_inode->m };
@@ -1009,6 +1056,7 @@ static Inode *create_new_inode(int fd, fuse_entry_param *e)
 		     << p_inode->nlookup << endl;
 
 	p_inode->fd = fd;
+	fs.ino_map[e->attr.st_ino] = p_inode;
 	fs_lock.unlock();
 
 	if (fs.debug)
@@ -1051,6 +1099,8 @@ static void sfs_tmpfile(fuse_req_t req, fuse_ino_t parent, mode_t mode,
 
 	if (fs.passthrough)
 		do_passthrough_open(req, e.ino, fd, fi);
+
+	e.backing_id = inode->backing_id;
 
 	fuse_reply_create(req, &e, fi);
 }
@@ -1111,6 +1161,7 @@ static void sfs_open(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi)
 	fi->fh = fd;
 	if (fs.passthrough)
 		do_passthrough_open(req, ino, fd, fi);
+
 	fuse_reply_open(req, fi);
 }
 
@@ -1119,20 +1170,6 @@ static void sfs_release(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi)
 	Inode &inode = get_inode(ino);
 	lock_guard<mutex> g{ inode.m };
 	inode.nopen--;
-
-	/* Close the shared backing file on last file close of an inode */
-	if (inode.backing_id && !inode.nopen) {
-		if (fuse_passthrough_close(req, inode.backing_id) < 0) {
-			cerr << "DEBUG: fuse_passthrough_close failed for inode "
-			     << ino << " backing file " << inode.backing_id
-			     << endl;
-		} else if (fs.debug) {
-			cerr << "DEBUG: closed backing file "
-			     << inode.backing_id << " for inode " << ino
-			     << endl;
-		}
-		inode.backing_id = 0;
-	}
 
 	close(fi->fh);
 	fuse_reply_err(req, 0);
